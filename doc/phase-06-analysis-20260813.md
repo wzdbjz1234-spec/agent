@@ -52,11 +52,11 @@
 | Command | Result | Evidence/notes |
 |---|---|---|
 | `uv lock --check --offline` | `PASS` | 30 packages resolved，lock 一致 |
-| `uv run --offline ruff format --check .` | `PASS` | 145 files already formatted |
+| `uv run --offline ruff format --check .` | `PASS` | 148 files already formatted |
 | `uv run --offline ruff check .` | `PASS` | All checks passed |
 | `uv run --offline pyright` | `PASS` | 0 errors, 0 warnings, 0 informations |
-| `uv run --offline pytest -q` | `PASS` | 190 passed |
-| `uv run --offline pytest --cov=dataharness --cov-report=term-missing -q` | `PASS` | 190 passed，总覆盖率 91% |
+| `uv run --offline pytest -q` | `PASS` | 191 passed |
+| `uv run --offline pytest --cov=dataharness --cov-report=term-missing -q` | `PASS` | 191 passed，总覆盖率 91% |
 | `uv run --offline python -m dataharness.tooling.dependency_check` | `PASS` | 依赖方向检查无违规 |
 | `python -c` module probe | `PARTIAL` | DuckDB/PyArrow 可用；pandas/Pandera 不在当前环境，真实 runner 未启用 |
 
@@ -82,4 +82,4 @@
 
 ## 11. Next-phase entry check
 
-Phase 07 的接口前置条件部分具备：AnalysisRuntime 已有稳定请求/结果、Step、幂等、失败分类、Workspace staging 和 Sandbox seam。进入 Phase 07 前仍需完成 Phase 05 的真实 Sandbox Gate，并携带本报告的 190-test fixture、CoverageReport/lineage 断言和恢复摘要协议；在此之前计划中的 Phase 06/07 不能标记为 `COMPLETED`。
+Phase 07 的接口前置条件部分具备：AnalysisRuntime 已有稳定请求/结果、Step、幂等、失败分类、Workspace staging 和 Sandbox seam。进入 Phase 07 前仍需完成 Phase 05 的真实 Sandbox Gate，并携带本报告的 191-test fixture、CoverageReport/lineage 断言和恢复摘要协议；在此之前计划中的 Phase 06/07 不能标记为 `COMPLETED`。
