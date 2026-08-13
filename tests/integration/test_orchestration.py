@@ -14,12 +14,14 @@ from dataharness.domain import (
     ProjectSnapshot,
     RunStatus,
     SnapshotId,
+    StepId,
     TaskStatus,
     WaitReason,
 )
 from dataharness.idgen import DeterministicIdFactory
 from dataharness.orchestration import (
     ExecutionDecision,
+    HostCrashError,
     RecoveryDecision,
     RunExecutionContext,
     RunOutcome,
@@ -60,7 +62,10 @@ class System:
             workspace=self.workspace,
         )
         self.runs = RunService(
-            self.store, id_factory=DeterministicIdFactory("run"), clock=self.clock.now
+            self.store,
+            id_factory=DeterministicIdFactory("run"),
+            clock=self.clock.now,
+            workspace=self.workspace,
         )
 
     def create_run(self):
@@ -178,7 +183,17 @@ async def test_waiting_resume_and_checkpointed_sandbox_loss_rebuild(tmp_path: Pa
     assert first is not None and first.status is RunStatus.WAITING
     assert system.runs.get(run.id).project_snapshot_id == system.snapshot.id
     system.runs.resume(run.id)
-    second = await executor.run_once()
+    restarted_executor = LocalDurableExecutor(
+        system.store,
+        handler,
+        owner="worker-b",
+        clock=system.clock.now,
+        sandbox=provider,
+        sandbox_spec_factory=spec_factory,
+        backoff_base=0,
+        workspace=system.workspace,
+    )
+    second = await restarted_executor.run_once()
     assert second is not None and second.status is RunStatus.SUCCEEDED
     assert decisions == [
         RecoveryDecision.START_FROM_BEGINNING,
@@ -221,14 +236,64 @@ async def test_retry_is_classified_bounded_and_reclaimed_by_same_run(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_host_crash_recovers_same_run_and_does_not_reopen_terminal_run(
+    tmp_path: Path,
+) -> None:
+    system = System(tmp_path)
+    task, run = system.create_run()
+    calls = 0
+
+    async def first_handler(context: RunExecutionContext) -> RunOutcome:
+        nonlocal calls
+        calls += 1
+        raise HostCrashError("synthetic host crash")
+
+    crashing_executor = LocalDurableExecutor(
+        system.store,
+        first_handler,
+        owner="worker-a",
+        clock=system.clock.now,
+        max_retries=1,
+        backoff_base=0,
+    )
+    recovered = await crashing_executor.run_once()
+    assert recovered is not None and recovered.status is RunStatus.RUNNING
+
+    async def recovered_handler(context: RunExecutionContext) -> RunOutcome:
+        assert context.recovered
+        assert context.run.id == run.id
+        assert context.run.project_snapshot_id == system.snapshot.id
+        return RunOutcome(decision=ExecutionDecision.SUCCEEDED)
+
+    restarted = LocalDurableExecutor(
+        system.store,
+        recovered_handler,
+        owner="worker-b",
+        clock=system.clock.now,
+        max_retries=1,
+        backoff_base=0,
+    )
+    result = await restarted.run_once()
+    assert result is not None and result.status is RunStatus.SUCCEEDED
+    assert system.tasks.get(task.id).status is TaskStatus.COMPLETED
+    assert await restarted.run_once() is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_is_idempotent_and_cleans_only_unpublished_staging(tmp_path: Path) -> None:
     system = System(tmp_path)
     task, run = system.create_run()
+    staged = system.workspace.staging_path(
+        system.project.id, task.id, StepId("step-unpublished"), "draft.txt"
+    )
+    staged.write_text("not yet published", encoding="utf-8")
+    assert staged.exists()
     first = system.runs.cancel(run.id)
     second = system.runs.cancel(run.id)
     assert first.status is RunStatus.CANCELLED
     assert second == first
     assert system.tasks.get(task.id).status is TaskStatus.CANCELLED
+    assert not staged.exists()
 
     async def should_not_run(context: RunExecutionContext) -> RunOutcome:
         raise AssertionError("cancelled Run must not invoke handler")

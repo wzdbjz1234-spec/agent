@@ -97,10 +97,12 @@ class RunService:
         *,
         id_factory: IdFactory | None = None,
         clock: Callable[[], datetime] = utcnow,
+        workspace: VirtualWorkspace | None = None,
     ) -> None:
         self._store = store
         self._ids = id_factory or UuidIdFactory()
         self._clock = clock
+        self._workspace = workspace
 
     def create(self, task_id: TaskId, project_snapshot_id: SnapshotId) -> Run:
         """创建绑定 Task Project 与指定 Snapshot 的新 Run。
@@ -143,6 +145,8 @@ class RunService:
                     uow.repo.save_task(
                         stored.value.cancel(self._clock()), stored.version, "TASK_CANCELLED"
                     )
+            if self._workspace is not None:
+                self._workspace.cleanup_staging(result.project_id, result.task_id)
         return result
 
     def resume(self, run_id: RunId) -> Run:
