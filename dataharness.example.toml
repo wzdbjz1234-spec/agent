@@ -1,0 +1,41 @@
+# DataHarness 示例配置（TOML）。
+# 复制并修改后通过 `dataharness check --config <path>` 校验。
+# 注意：不在此处填写任何真实 API 密钥；密钥经环境变量注入。
+
+[paths]
+# 本地运行数据根目录；projects/ 与 privacy/ 缺省派生自该根
+runtime_data_root = "runtime-data"
+
+[model]
+provider = "openai"
+model = "gpt-4o-mini"
+# 仅记录环境变量名，运行时从环境读取实际密钥
+api_key_env = "DATAHARNESS_MODEL_API_KEY"
+timeout_seconds = 120.0
+
+[sandbox]
+endpoint = "http://127.0.0.1:8080"
+runtime = "secure-analysis"
+# 生产环境必须锁定镜像 digest（如 "sha256:..."）；此处省略表示待锁定
+network_enabled = false
+
+[extraction]
+max_file_bytes = 104857600
+supported_formats = ["csv", "parquet", "xlsx", "json", "pdf", "docx", "pptx", "md", "txt"]
+
+[index]
+bm25_k1 = 1.2
+bm25_b = 0.75
+max_snippet_chars = 2000
+
+[budget]
+max_analysis_steps = 50
+max_consecutive_failures = 3
+max_run_duration_seconds = 3600
+
+[resources]
+# cpu_limit = 2.0  # 可选：CPU 核数上限；缺省不限
+memory_mb = 1024
+disk_mb = 2048
+max_output_bytes = 10485760
+step_timeout_seconds = 300

@@ -7,6 +7,9 @@ dependencies = [
     "pydantic>=2.7",
 ]
 
+[project.scripts]
+dataharness = "dataharness.cli:main"
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.100",
