@@ -6,7 +6,7 @@
 
 ## 1. 产品定位
 
-DataHarness 面向单机、单租户、长时运行的数据分析任务。云端 LLM 负责理解目标、规划、生成 Python/SQL、观察结果与组织回答；真实代码在本地 OpenSandbox 中执行；任务状态、数据文件、产物、证据与隐私占位映射保存在本机。
+DataHarness 面向单机、单租户、长期项目资料与长时运行的数据分析任务。用户将文件导入持久 Project；云端 LLM 负责理解目标、跨文件检索与整合、规划、生成 Python/SQL、观察结果与组织回答；真实代码在本地 OpenSandbox 中执行；项目文件及索引、任务状态、产物、证据与隐私占位映射保存在本机。
 
 项目的准确承诺是：
 
@@ -26,12 +26,12 @@ DataHarness 面向单机、单租户、长时运行的数据分析任务。云�
 ### 2.2 V1 主要防护目标
 
 - LLM 生成代码不得在 Host 中执行或读取 Host 凭据。
-- Sandbox 只能访问当前 Task 的 Workspace，默认不能联网。
+- Sandbox 只能只读访问当前 Run 固定的 ProjectSnapshot，并写当前 Task Workspace，默认不能联网。
 - Runtime SQLite 与隐私映射库不得暴露给 Agent 或 Sandbox。
 - 密码、API Token、私钥、Cookie、连接串等凭据不得发送给模型。
 - 常见 PII 在出境视图中使用 Task 内稳定的类型化占位符。
 - 长任务可暂停、取消、恢复；崩溃后不依赖进程内状态。
-- 最终 Finding 必须绑定可检查的分析证据。
+- 最终 Finding 必须绑定可检查的分析证据及实际使用的 ProjectFileVersion。
 
 ### 2.3 非目标
 
@@ -55,6 +55,7 @@ DataHarness 自研领域策略、生命周期、边界协议和组件编排，�
 Domain Model                        PydanticAI Agent Loop / Provider SDK
 Task/Run/Step 状态与本地执行器       OpenSandbox Runtime
 VirtualWorkspace / Workspace Bridge  DuckDB / pandas / PyArrow / Pandera
+ProjectCorpus / Snapshot / Coverage  SQLite FTS5/BM25 / document parsers
 Analysis Runtime                    Agent Skills 格式
 ModelGateway / Privacy              OpenTelemetry
 Publication / Verification / Lineage
@@ -93,9 +94,11 @@ User / Local Client
 FastAPI (thin API)
         |
         v
-TaskService / RunService / LocalDurableExecutor
+ProjectService / TaskService / RunService / LocalDurableExecutor
         |                         |
         |                         +--> Runtime SQLite
+        |
+        +--> ProjectCorpus --> LocalWorkspace + FTS5/BM25
         v
 PydanticAI Agent
    |            |
@@ -108,11 +111,11 @@ ModelGateway -----------------------------> Cloud LLM API
         |
         v
 Analysis Tools
-   | execute_python / execute_sql / workspace operations
+   | project search / inspect / execute_python / execute_sql
    v
 AnalysisRuntime --> AnalysisStep / Dataset / Artifact / Finding / Lineage
         |
-        +--> VirtualWorkspace (LocalWorkspaceProvider)
+        +--> ProjectSnapshot + TaskWorkspace (LocalWorkspaceProvider)
         |
         +--> SandboxProvider (OpenSandboxProvider)
                          |
@@ -126,7 +129,7 @@ AnalysisRuntime --> AnalysisStep / Dataset / Artifact / Finding / Lineage
 ```text
 api
  -> orchestration
- -> agent / capabilities / analysis
+ -> agent / capabilities / analysis / projects
  -> domain + workspace/sandbox/model protocols
  -> providers / storage
 ```
@@ -137,11 +140,11 @@ api
 
 ### 5.1 `domain/`
 
-定义 Session、Task、Run、AnalysisStep、Dataset、Artifact、Finding、Lineage、状态、值对象和领域错误。领域对象不执行 I/O。
+定义 Project、ProjectFile、ProjectFileVersion、ProjectSnapshot、ProjectCoverageReport、Session、Task、Run、AnalysisStep、Dataset、Artifact、Finding、Lineage、状态、值对象和领域错误。领域对象不执行 I/O。
 
 ### 5.2 `api/`
 
-提供创建、查询、取消、恢复 Task 以及事件、Dataset、Artifact、Workspace 文件访问。API 只做输入校验、服务调用和错误映射。
+提供 Project 创建与查询、文件导入与版本查询、项目检索，以及 Task 创建、查询、取消、恢复、事件、Dataset、Artifact 和受控文件访问。API 只做输入校验、服务调用和错误映射。
 
 V1 不提供 Webhook；SSE/WebSocket 可选，但必须复用相同事件流和脱敏规则。
 
@@ -153,19 +156,23 @@ V1 不提供 Webhook；SSE/WebSocket 可选，但必须复用相同事件流和�
 
 装配 PydanticAI Agent、ModelGateway、UsageLimits、Tools、Skills、Checkpoint 与 Compaction。不得实现第二套 Agent Loop。
 
-### 5.5 `analysis/`
+### 5.5 `projects/`（新增）
+
+实现 ProjectCorpus deep module：项目生命周期、文件版本导入、格式提取、全文索引、ProjectSnapshot、跨文件检索与覆盖报告。对外保持 `import_files/create_snapshot/search/open_resource` 等小型 Interface；路径与索引细节隐藏在 Implementation。
+
+### 5.6 `analysis/`
 
 负责 AnalysisStep、代码/SQL 执行请求、输出发布、Dataset/Artifact 注册、轻量 Verification 和 Lineage。
 
-### 5.6 `workspace/`
+### 5.7 `workspace/`
 
-定义 VirtualWorkspace 与 WorkspaceBridge。V1 正式实现为受控本地目录；AgentFS 仅是未来可选 Provider，不是依赖。
+定义 Project/Task 文件命名空间、路径策略、WorkspaceBridge 与发布原语。它不承担文件版本、检索或项目覆盖语义。V1 正式实现为受控本地目录；AgentFS 仅是未来可选 Provider，不是依赖。
 
-### 5.7 `sandbox/`
+### 5.8 `sandbox/`
 
 定义 SandboxProvider、Sandbox lease、执行请求和执行结果。V1 唯一正式 Provider 是 OpenSandbox。
 
-### 5.8 `privacy/`（新增）
+### 5.9 `privacy/`
 
 定义 SecretDetector、PIIDetector、PlaceholderStore、PrivacyPolicy、ModelGateway 与隐私审计元数据。它是所有云模型请求的唯一出口。
 
@@ -180,52 +187,90 @@ src/dataharness/privacy/
 └── audit.py
 ```
 
-### 5.9 `skills/`
+### 5.10 `skills/`
 
 只发现管理员预先安装的本地 Agent Skills。支持 `SKILL.md/scripts/references/assets` 渐进加载；不支持运行时下载、安装或自动更新。
 
-### 5.10 `storage/`
+### 5.11 `storage/`
 
-Runtime SQLite 是 Task/Run/Step 与领域元数据的事实来源，并承载本地任务队列、lease、事件及幂等记录。它不保存大型文件或隐私原值。
+Runtime SQLite 是 Project/FileVersion/Snapshot、Task/Run/Step 与领域元数据的事实来源，并承载本地任务队列、lease、事件及幂等记录。它不保存大型文件或隐私原值。
 
 ## 6. 事实来源
 
 | 内容 | 唯一事实来源 |
 |---|---|
+| Project、ProjectFileVersion、ProjectSnapshot 与索引元数据 | Runtime SQLite |
 | Task/Run/Step 状态、重试、lease | Runtime SQLite |
 | Dataset/Artifact/Finding/Lineage 元数据 | Runtime SQLite |
 | Agent 消息与模型步骤 | PydanticAI checkpoint |
-| 原始数据、代码、中间结果、正式产物 | Task Workspace |
-| PLAN/PROGRESS/CONTEXT | Workspace `/state` 文件 |
+| 项目原始文件、提取结果、索引文件、正式项目产物 | Project Workspace |
+| 代码、中间结果与 staging | Task Workspace |
+| PLAN/PROGRESS/CONTEXT | Task Workspace `/state` 文件 |
 | PII 占位映射 | Task 独立 Privacy SQLite |
 | Sandbox | 临时计算资源，不是事实来源 |
 
-`RUN.json` 是不可变复现清单，不复制可变业务状态。至少记录模型与设置、Sandbox image digest、Skill 内容 hash、输入/代码 hash、随机种子和隐私映射版本。
+`RUN.json` 是不可变复现清单，不复制可变业务状态。至少记录 project_id、project_snapshot_id、全部输入 ProjectFileVersion ID/hash、索引版本、模型与设置、Sandbox image digest、Skill 内容 hash、代码 hash、随机种子和隐私映射版本。
 
-## 7. Workspace
+## 7. Project Corpus 与 Workspace
 
-V1 每个 Task 使用一个受控本地目录：
+### 7.1 目录布局
+
+Project 是长期数据生命周期；Task/Run/Step 是计算生命周期。V1 使用：
 
 ```text
-runtime-data/tasks/{task_id}/
-├── inputs/       # 原始输入，只读、不可变
-├── working/      # 中间数据与代码
-├── staging/      # 当前 Step 待发布输出
-├── datasets/     # 正式派生数据
-├── artifacts/    # 正式展示产物
-└── state/
-    ├── PLAN.md
-    ├── PROGRESS.md
-    ├── CONTEXT.md
-    └── RUN.json
+runtime-data/projects/{project_id}/
+├── sources/{file_id}/{version_id}/  # 原始文件版本，只读、不可变
+├── extracted/                       # 本地提取文本、表格元数据
+├── indexes/                         # FTS5/BM25 与检索清单
+├── datasets/                        # 项目级正式派生数据
+├── artifacts/                       # 项目级正式展示产物
+├── manifests/                       # 文件与 snapshot 清单
+└── tasks/{task_id}/
+    ├── working/                     # 当前 Task 中间数据与代码
+    ├── staging/{step_id}/           # 当前 Step 待发布输出
+    └── state/
+        ├── PLAN.md
+        ├── PROGRESS.md
+        ├── CONTEXT.md
+        └── RUN.json
 ```
 
 约束：
 
+- Host 根据 project_id 创建受控路径；Agent 不能指定或拼接任意 Host 文件夹。
 - 输入导入时规范化名称、识别真实格式、拒绝链接/设备/可执行文件并计算 hash。
-- `/inputs` 对 Sandbox 只读；Agent 不能覆盖或删除原始文件。
+- 同一逻辑文件的更新创建新的 ProjectFileVersion；禁止覆盖或删除被 Snapshot 引用的版本。
+- Project 的 sources/extracted/已发布 datasets 对 Sandbox 只读；Agent 不能覆盖或删除原始文件。
 - 所有路径经过规范化和真实路径校验，拒绝 `..`、宿主绝对路径和符号链接逃逸。
-- Workspace 是 Task 级资源；不同 Run 复用已发布数据，但拥有独立 Checkpoint、预算和 Step 序列。
+- 不同 Task 可读取相同 ProjectSnapshot，但拥有独立 Sandbox、working、staging、Checkpoint、预算和 Step 序列。
+
+### 7.2 文件导入、提取与索引
+
+V1 支持 CSV、Parquet、Excel、JSON、PDF、DOCX、PPTX、Markdown 与纯文本。结构化文件提取 schema、工作表和统计元数据；文档提取带页码、段落或幻灯片定位的文本。图片 OCR、音视频和未知格式登记为 `UNSUPPORTED`，不假装已经分析。
+
+```text
+upload
+ -> validate real type / size / path
+ -> immutable ProjectFileVersion + SHA-256
+ -> local extraction
+ -> FTS5/BM25 + metadata index
+ -> READY | FAILED | UNSUPPORTED
+```
+
+提取物和索引均绑定 source hash 与 extractor version，可删除后重建，不替代原始文件事实。
+
+### 7.3 ProjectSnapshot
+
+Task 创建时必须绑定一个 Project；Run 开始前创建不可变 ProjectSnapshot，固定文件版本、索引版本和已发布 Dataset 版本。Run 进行期间的新上传或新版本默认不进入该 Run。崩溃恢复必须使用同一 Snapshot；用户要求使用最新文件时创建新 Run/Snapshot。
+
+### 7.4 跨文件检索与完整覆盖
+
+Agent 有两种显式检索模式：
+
+- `RELEVANT`：使用文件元数据过滤与 FTS5/BM25 找到相关片段，回答只能声称使用了实际引用的文件。
+- `FULL_PROJECT`：枚举 Snapshot 中所有受支持文件，分批提取/分析并生成 ProjectCoverageReport。报告记录总数、成功、失败、不支持、跳过及原因；未完整覆盖时不得声称“分析了所有项目文件”。
+
+V1 不需要向量数据库实现跨文件能力。结构化数据优先经 DuckDB 分析，文档使用本地全文检索；未来语义检索可作为独立 SemanticIndexProvider。
 
 ## 8. Sandbox 与代码执行
 
@@ -246,6 +291,7 @@ class SandboxProvider(Protocol):
 ### 8.2 生命周期
 
 - 一个 Run 默认复用一个可替换的 Sandbox lease。
+- Sandbox 只读挂载当前 Run 的 ProjectSnapshot，并只写当前 Task 的 working 与当前 Step staging；同一 Project 的并行 Run 使用独立 lease。
 - 每个 AnalysisStep 在独立进程和独立 `/staging/{step_id}` 中执行。
 - 不使用持久 REPL；Step 之间不能依赖 Python 变量、后台进程或 Sandbox 内存。
 - 每步结束后清理残留进程；Sandbox 丢失后使用相同镜像 digest 和 Workspace 重建。
@@ -258,8 +304,12 @@ V1 使用 PydanticAI 原生工具调用，不采用 CodeMode/Monty。核心工�
 ```text
 execute_python
 execute_sql
-list_workspace
-read_text
+list_project_files
+search_project
+inspect_project_file
+preview_project_table
+query_project_tables
+get_project_coverage
 inspect_output
 submit_finding
 ```
@@ -276,11 +326,11 @@ submit_finding
 
 ## 9. 数据入口与数据库边界
 
-V1 只分析导入 Workspace 的文件：CSV、Parquet、Excel、JSON，以及可选的 DuckDB/SQLite 快照。
+V1 只分析导入 Project 的受支持文件及可选 DuckDB/SQLite 快照，不直接读取任意 Host 路径。
 
 - Runtime SQLite 对 Agent/Sandbox 完全不可见。
 - V1 不连接外部在线数据库。
-- Sandbox 内属于当前 Task 的 DuckDB/SQLite 可自由读写，用于临时和派生分析。
+- Project 原始 DuckDB/SQLite 快照只读；Sandbox 内属于当前 Task 的临时 DuckDB/SQLite 可自由读写。
 - 未来接入在线数据库时应使用独立只读账号、超时、限行和限结果大小的 SQL Tool。
 
 ## 10. ModelGateway 与隐私占位
@@ -338,16 +388,34 @@ Agent Memory 不依赖向量数据库：
 Working state     -> Workspace state files
 Task/Run metadata -> Runtime SQLite
 Conversation      -> PydanticAI checkpoint
+Project retrieval -> metadata + SQLite FTS5/BM25
 History search    -> SQLite FTS5/BM25（按需）
 ```
 
-V1 不提供向量记忆。面向用户文档的语义检索是未来可选 `SemanticIndexProvider`，不属于 MemoryCapability。
+V1 不提供向量记忆。Project 文件检索属于 ProjectCorpus，不属于 MemoryCapability；面向用户文档的语义检索是未来可选 `SemanticIndexProvider`。
 
-上下文窗口管理复用 PydanticAI/Pydantic AI Harness Compaction。DataHarness 只负责在压缩前持久化当前目标、计划、已完成步骤、Dataset/Artifact 引用、已验证 Finding 和未解决问题。大型 Tool Result 写入 Workspace，只向模型提供有界内容或引用。
+上下文窗口管理复用 PydanticAI/Pydantic AI Harness Compaction。DataHarness 只负责在压缩前持久化当前目标、计划、已完成步骤、ProjectSnapshot/FileVersion、Dataset/Artifact 引用、已验证 Finding 和未解决问题。大型 Tool Result 写入 Workspace，只向模型提供有界内容或引用。
 
 ## 13. 状态机
 
-### 13.1 Task
+### 13.1 Project 与文件版本
+
+Project 是长期容器，不随单个 Task 结束而删除；归档只禁止新 Task/文件版本，不破坏历史 Snapshot。ProjectFileVersion 的处理状态为：
+
+```python
+FileVersionStatus = IMPORTING | READY | FAILED | UNSUPPORTED
+```
+
+ProjectSnapshot 记录创建时每个逻辑文件的当前版本及处理状态；只有 `READY` 条目可供检索和挂载，但 `FULL_PROJECT` Coverage 必须列出 FAILED/UNSUPPORTED 条目。ProjectSnapshot 创建后不可变，不提供“更新 Snapshot”操作。
+
+```python
+ProjectStatus = ACTIVE | ARCHIVED
+CoverageItemStatus = PROCESSED | FAILED | UNSUPPORTED | SKIPPED
+```
+
+ARCHIVED Project 不接受新文件版本或新 Task，但不删除既有 Snapshot、运行记录和正式产物。
+
+### 13.2 Task
 
 ```text
 QUEUED -> ACTIVE -> COMPLETED
@@ -365,7 +433,9 @@ WaitReason = USER_INPUT | BUDGET_EXHAUSTED | RETRY_APPROVAL | MISSING_DEPENDENCY
 
 删除 `SUSPENDED`；统一使用 `WAITING + wait_reason`。
 
-### 13.2 Run
+每个分析 Task 必须绑定一个 Project；一个 Task 不能跨 Project 读取数据。跨 Project 分析留作未来显式导入/合并能力。
+
+### 13.3 Run
 
 ```python
 RunStatus = QUEUED | RUNNING | WAITING | SUCCEEDED | FAILED | CANCELLED
@@ -374,7 +444,7 @@ RunPhase = PREPARING | REASONING | EXECUTING | VERIFYING | FINALIZING
 
 `status` 表达生命周期，`phase` 表达当前工作。终态 Run 永不重新打开；用户重试创建新的 Run。补充信息或预算从 `WAITING` 恢复同一 Run。
 
-### 13.3 AnalysisStep
+### 13.4 AnalysisStep
 
 ```python
 StepStatus = PENDING | RUNNING | SUCCEEDED | FAILED | TIMED_OUT | CANCELLED
@@ -384,7 +454,7 @@ StepFailureKind = MODEL_CORRECTABLE | RESOURCE_LIMIT | SANDBOX_ERROR |
 
 失败 Step 不回到 RUNNING；重试创建新 Step，并通过 `retry_of_step_id` 关联。
 
-### 13.4 Finding
+### 13.5 Finding
 
 ```python
 FindingStatus = DRAFT | VERIFIED | WARNING | REJECTED
@@ -402,7 +472,7 @@ V1 不依赖 Prefect。Runtime SQLite 与 LocalDurableExecutor 提供：
 - 取消、超时、幂等键和有限重试；
 - 从最后已提交 Checkpoint 与 Workspace 恢复。
 
-Host/Sandbox 故障恢复同一 Run；Agent 修正代码属于同一 Run 的新 Step；只有终态 Run 的用户重试才创建新 Run。
+Host/Sandbox 故障恢复同一 Run，并固定使用原 ProjectSnapshot；Agent 修正代码属于同一 Run 的新 Step；只有终态 Run 的用户重试才创建新 Run。
 
 ## 15. 取消语义
 
@@ -445,15 +515,18 @@ V1 只有三个 Gate：
 ### IntegrityGate
 
 - 输入 Dataset、代码、镜像、Skill 与输出 hash 完整；
+- ProjectSnapshot、ProjectFileVersion、提取器/索引版本及其 hash 完整；
 - Artifact/Dataset 注册记录与文件一致；
 - Run manifest 信息齐全。
 
 ### EvidenceGate
 
 - 每个最终 Finding 是结构化对象；
-- 至少引用一个属于当前 Task/Run 的有效证据；
-- 证据可追溯到 AnalysisStep、输入 Dataset、代码或 Artifact；
+- 至少引用一个属于当前 ProjectSnapshot 与 Task/Run 的有效证据；
+- 证据可追溯到 ProjectFileVersion 的页码/段落/工作表/行范围，或 AnalysisStep、输入 Dataset、代码、Artifact；
 - 内容 hash 未变化。
+
+`FULL_PROJECT` 回答还必须绑定 ProjectCoverageReport；存在 FAILED、UNSUPPORTED 或 SKIPPED 项时，最终回答明确披露覆盖缺口。
 
 行数异常变化、Join 膨胀、缺失值、类型转换失败与重复值仅生成 Warning，不自动阻断。V1 不做通用真伪判断、自动统计检验、因果判断或 LLM 自审。
 
@@ -486,7 +559,16 @@ trace_id / task_id / run_id / step_id / tool_call_id / sandbox_id
 ## 20. V1 API
 
 ```text
-POST /tasks
+POST /projects
+GET  /projects
+GET  /projects/{id}
+POST /projects/{id}/files
+GET  /projects/{id}/files
+GET  /projects/{id}/files/{file_id}/versions
+GET  /projects/{id}/search
+GET  /projects/{id}/datasets
+GET  /projects/{id}/artifacts
+POST /projects/{id}/tasks
 GET  /tasks/{id}
 POST /tasks/{id}/cancel
 POST /tasks/{id}/resume
@@ -494,7 +576,6 @@ POST /tasks/{id}/retry
 GET  /tasks/{id}/events
 GET  /tasks/{id}/artifacts
 GET  /tasks/{id}/datasets
-GET  /tasks/{id}/files
 ```
 
 SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
@@ -509,6 +590,8 @@ SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
 | Skills、Compaction 等能力 | [Pydantic AI Harness](https://github.com/pydantic/pydantic-ai-harness) | 按需复用；不采用 CodeMode |
 | Sandbox 平台 | [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) | V1 唯一 SandboxProvider |
 | 数据计算 | [DuckDB](https://github.com/duckdb/duckdb)、pandas、PyArrow | Sandbox 内执行 |
+| 项目全文检索 | SQLite FTS5/BM25 | 本地跨文件检索，不引入向量数据库 |
+| 文档提取 | pypdf、python-docx、python-pptx、openpyxl | 本地生成可定位提取物 |
 | DataFrame 约束 | [Pandera](https://github.com/unionai-oss/pandera) | 轻量验证 |
 | PII 检测 | [Microsoft Presidio](https://github.com/microsoft/presidio) | 检测器参考/可选依赖 |
 | 凭据规则 | [Gitleaks](https://github.com/gitleaks/gitleaks)、[detect-secrets](https://github.com/Yelp/detect-secrets) | 规则与测试语料参考 |
@@ -538,12 +621,15 @@ SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
 ## 22. V1 验收链路
 
 ```text
-导入 CSV/Parquet/Excel/JSON
- -> 创建 Task/Run/Workspace
+创建 Project 并导入多个受支持文件
+ -> 生成不可变 ProjectFileVersion
+ -> 本地提取并建立 FTS5/BM25 索引
+ -> 创建 Task/Run 并固定 ProjectSnapshot
  -> LocalDurableExecutor 领取 Run
- -> 创建 OpenSandbox lease
+ -> 创建独立 OpenSandbox lease，只读挂载 Snapshot
  -> PydanticAI 经 ModelGateway 调用云模型
  -> 凭据阻断、PII 占位
+ -> RELEVANT 检索或 FULL_PROJECT 全量枚举
  -> execute_python / execute_sql
  -> 每步独立进程与 staging
  -> 发布 Dataset/Artifact，记录 hash 与 lineage
@@ -561,7 +647,10 @@ SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
 - Runtime DB、Privacy DB 和凭据从未进入 Sandbox；
 - 凭据未越过 ModelGateway；
 - PII 占位不修改本地原始数据，并能在 Task 内稳定恢复；
-- 原始输入不可变；
+- Project 原始文件版本不可变，新上传生成新版本；
+- Run 恢复始终使用相同 ProjectSnapshot；
+- 两个 Task 可并行分析同一 Project，且 Sandbox、working、staging 和取消互不影响；
+- RELEVANT 回答披露实际使用的文件版本；FULL_PROJECT 回答具有覆盖报告并披露缺口；
 - Host 重启后已完成 Step 不重复执行；
 - 每个 VERIFIED Finding 有有效证据链；
 - 取消与预算耗尽不会留下运行进程或发布半成品。
