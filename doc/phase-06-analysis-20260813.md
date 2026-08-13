@@ -56,7 +56,7 @@
 | `uv run --offline ruff check .` | `PASS` | All checks passed |
 | `uv run --offline pyright` | `PASS` | 0 errors, 0 warnings, 0 informations |
 | `uv run --offline pytest -q` | `PASS` | 191 passed |
-| `uv run --offline pytest --cov=dataharness --cov-report=term-missing -q` | `PASS` | 191 passed，总覆盖率 91% |
+| `uv run --offline pytest --cov=dataharness --cov-report=term-missing -q` | `PASS` | 191 passed，总覆盖率 92% |
 | `uv run --offline python -m dataharness.tooling.dependency_check` | `PASS` | 依赖方向检查无违规 |
 | `python -c` module probe | `PARTIAL` | DuckDB/PyArrow 可用；pandas/Pandera 不在当前环境，真实 runner 未启用 |
 
