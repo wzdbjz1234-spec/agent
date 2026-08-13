@@ -10,6 +10,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
+sandbox-images/secure-analysis/build-evidence/
 coverage.xml
 htmlcov/
 

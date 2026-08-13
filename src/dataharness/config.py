@@ -77,6 +77,13 @@ class SandboxConfig(BaseModel):
     image_digest: str | None = None
     network_enabled: bool = False
 
+    @model_validator(mode="after")
+    def _reject_network(self) -> SandboxConfig:
+        """V1 没有运行期网络开关；即使配置文件显式要求也必须在装配前失败。"""
+        if self.network_enabled:
+            raise ValueError("V1 Sandbox 不允许启用网络")
+        return self
+
 
 class ExtractionConfig(BaseModel):
     """文件导入与本地提取配置。"""
@@ -125,6 +132,7 @@ class ResourceLimitsConfig(BaseModel):
     cpu_limit: float | None = None
     memory_mb: int = 1024
     disk_mb: int = 2048
+    max_processes: int = 32
     max_output_bytes: int = 10 * 1024 * 1024
     step_timeout_seconds: int = 300
 

@@ -21,6 +21,12 @@ def test_default_sandbox_network_disabled() -> None:
     assert Settings().sandbox.network_enabled is False
 
 
+def test_sandbox_network_cannot_be_enabled() -> None:
+    """配置也不能成为放宽 Sandbox 网络边界的旁路。"""
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"sandbox": {"network_enabled": True}})
+
+
 def test_load_settings_from_toml_overrides_and_falls_back(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(

@@ -30,7 +30,7 @@
 | 02 | Runtime storage and durable primitives | storage | 01 | COMPLETED | [phase-02-storage-20260813.md](phase-02-storage-20260813.md) |
 | 03 | Project corpus, workspace, import and publication | projects, workspace, providers/workspace | 01–02 | COMPLETED | [phase-03-project-corpus-20260813.md](phase-03-project-corpus-20260813.md) |
 | 04 | Privacy and ModelGateway | privacy, hooks | 00–02 | COMPLETED | [phase-04-privacy-20260813.md](phase-04-privacy-20260813.md) |
-| 05 | OpenSandbox execution seam | sandbox, providers/sandbox, images | 00, 03 | NOT_STARTED | — |
+| 05 | OpenSandbox execution seam | sandbox, providers/sandbox, images | 00, 03 | IN_PROGRESS | — |
 | 06 | Analysis runtime and agent capabilities | analysis, capabilities | 01–05 | NOT_STARTED | — |
 | 07 | Durable orchestration and recovery | orchestration, providers/durable | 01–06 | NOT_STARTED | — |
 | 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | NOT_STARTED | — |
