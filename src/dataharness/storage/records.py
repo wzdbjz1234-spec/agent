@@ -10,7 +10,7 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
-from dataharness.domain import ContentHash, Run, RunId
+from dataharness.domain import ContentHash, Run, RunId, RunPhase, SnapshotId
 
 T = TypeVar("T")
 
@@ -70,6 +70,26 @@ class CheckpointMetadata(BaseModel):
     sequence: int
     checkpoint_ref: str
     content_hash: ContentHash
+    created_at: datetime
+    # 这些字段把模型 checkpoint 变成可恢复的定位元数据：恢复时必须继续使用
+    # 创建 Run 时固定的 Snapshot，并且只能重连同一镜像下的已知 Sandbox。
+    project_snapshot_id: SnapshotId | None = None
+    sandbox_id: str | None = None
+    sandbox_image_digest: str | None = None
+    run_lease_epoch: int | None = None
+    phase: RunPhase | None = None
+
+
+class RetryRecord(BaseModel):
+    """一次自动重试的持久审计记录。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: RunId
+    attempt: int
+    failure_kind: str
+    delay_seconds: float
+    next_attempt_at: datetime
     created_at: datetime
 
 

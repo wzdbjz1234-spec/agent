@@ -19,6 +19,7 @@ from .records import (
     ClaimedRun,
     EventRecord,
     IdempotencyRecord,
+    RetryRecord,
     RunLease,
     StoredRecord,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "PrivacyConnectionFactory",
     "RecordNotFoundError",
     "RunLease",
+    "RetryRecord",
     "RuntimeConnectionFactory",
     "RuntimeRepository",
     "SqliteRuntimeStore",

@@ -273,6 +273,27 @@ class LocalWorkspace:
             project_id, "tasks", task_id, "staging", step_id, normalize_filename(output_name)
         )
 
+    def cleanup_staging(self, project_id: ProjectId, task_id: TaskId) -> None:
+        """清理当前 Task 尚未登记为正式资源的 staging 文件。
+
+        发布流程会先把文件移动到 datasets/artifacts，再标记 AVAILABLE；因此只删除
+        ``tasks/<task>/staging`` 不会触碰已发布资源。目标由受控组件拼接并再次验证，
+        不接受调用方传入宿主路径。
+        """
+        staging = self._within(project_id, "tasks", task_id, "staging")
+        if not staging.exists():
+            return
+        for child in staging.iterdir():
+            if child.is_symlink() or child.is_file():
+                child.unlink(missing_ok=True)
+            elif child.is_dir():
+                for nested in sorted(child.rglob("*"), reverse=True):
+                    if nested.is_symlink() or nested.is_file():
+                        nested.unlink(missing_ok=True)
+                    elif nested.is_dir():
+                        nested.rmdir()
+                child.rmdir()
+
     def _published_path(self, record: PublicationRecord) -> Path:
         namespace = "datasets" if record.kind == PublicationKind.DATASET else "artifacts"
         return self._within(

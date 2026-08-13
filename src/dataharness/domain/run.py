@@ -46,6 +46,10 @@ class Run(BaseModel):
     status: RunStatus = RunStatus.QUEUED
     phase: RunPhase = RunPhase.PREPARING
     wait_reason: WaitReason | None = None
+    # 取消请求是一个独立的耐久意图。RUNNING Run 不能在调用方线程中直接
+    # 改成终态，否则 worker 仍可能把正在执行的 Sandbox 结果提交回来；先记录
+    # 这个时间戳，worker 在确认 fencing token 后负责停止新调用、清理并收口状态。
+    cancel_requested_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     completed_at: datetime | None = None
@@ -117,8 +121,26 @@ class Run(BaseModel):
         check_transition(RUN_TRANSITIONS, self.status, RunStatus.CANCELLED, "Run")
         now = at or utcnow()
         return self.model_copy(
-            update={"status": RunStatus.CANCELLED, "updated_at": now, "completed_at": now}
+            update={
+                "status": RunStatus.CANCELLED,
+                "cancel_requested_at": self.cancel_requested_at or now,
+                "updated_at": now,
+                "completed_at": now,
+            }
         )
+
+    def request_cancel(self, at: datetime | None = None) -> Run:
+        """记录取消意图但不改变生命周期状态。
+
+        运行中的 Run 仍需要 worker 负责终止外部副作用，因此取消请求和终态收口
+        分成两个持久化动作；重复请求保持同一首次请求时间，便于幂等审计。
+        """
+        if self.status in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED):
+            return self
+        if self.cancel_requested_at is not None:
+            return self
+        now = at or utcnow()
+        return self.model_copy(update={"cancel_requested_at": now, "updated_at": now})
 
     def advance_phase(self, target: RunPhase, at: datetime | None = None) -> Run:
         """向前推进工作阶段；阶段只能在 RUNNING 状态下推进。"""

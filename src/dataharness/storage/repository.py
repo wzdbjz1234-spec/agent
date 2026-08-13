@@ -70,7 +70,14 @@ from .errors import (
     LeaseLostError,
     RecordNotFoundError,
 )
-from .records import CheckpointMetadata, EventRecord, IdempotencyRecord, RunLease, StoredRecord
+from .records import (
+    CheckpointMetadata,
+    EventRecord,
+    IdempotencyRecord,
+    RetryRecord,
+    RunLease,
+    StoredRecord,
+)
 
 T = TypeVar("T")
 
@@ -526,8 +533,8 @@ class RuntimeRepository:
 
     def add_run(self, run: Run) -> None:
         self._connection.execute(
-            "INSERT INTO runs(id, task_id, project_id, project_snapshot_id, status, phase, wait_reason, created_at, updated_at, completed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs(id, task_id, project_id, project_snapshot_id, status, phase, wait_reason, created_at, updated_at, completed_at, cancel_requested_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(run.id),
                 str(run.task_id),
@@ -539,6 +546,7 @@ class RuntimeRepository:
                 _iso(run.created_at),
                 _iso(run.updated_at),
                 _iso(run.completed_at),
+                _iso(run.cancel_requested_at),
             ),
         )
         self.append_event("run", str(run.id), "RUN_CREATED", run.created_at)
@@ -593,6 +601,7 @@ class RuntimeRepository:
             run.wait_reason,
             _iso(run.updated_at),
             _iso(run.completed_at),
+            _iso(run.cancel_requested_at),
             str(run.id),
             expected_version,
             current.value.status,
@@ -607,9 +616,12 @@ class RuntimeRepository:
             where += " AND lease_owner = ? AND lease_epoch = ? AND lease_expires_at > ?"
             params.extend([lease.owner, lease.epoch, _iso(lease_checked_at)])
         result = self._connection.execute(
-            "UPDATE runs SET status = ?, phase = ?, wait_reason = ?, updated_at = ?, completed_at = ?, "
+            "UPDATE runs SET status = ?, phase = ?, wait_reason = ?, updated_at = ?, completed_at = ?, cancel_requested_at = ?, "
+            "lease_owner = CASE WHEN ? IN ('WAITING', 'SUCCEEDED', 'FAILED', 'CANCELLED') THEN NULL ELSE lease_owner END, "
+            "lease_expires_at = CASE WHEN ? IN ('WAITING', 'SUCCEEDED', 'FAILED', 'CANCELLED') THEN NULL ELSE lease_expires_at END, "
+            "heartbeat_at = CASE WHEN ? IN ('WAITING', 'SUCCEEDED', 'FAILED', 'CANCELLED') THEN NULL ELSE heartbeat_at END, "
             f"row_version = row_version + 1 WHERE {where}",
-            params,
+            [*params[:6], run.status, run.status, run.status, *params[6:]],
         )
         if result.rowcount != 1 and lease is not None:
             raise LeaseLostError(f"Run {run.id} 的 lease epoch 已失效")
@@ -918,8 +930,17 @@ class RuntimeRepository:
         )
 
     def add_checkpoint(self, checkpoint: CheckpointMetadata) -> None:
+        existing = self._connection.execute(
+            "SELECT * FROM checkpoint_metadata WHERE run_id = ? AND sequence = ?",
+            (str(checkpoint.run_id), checkpoint.sequence),
+        ).fetchone()
+        if existing is not None:
+            if existing["content_hash"] != checkpoint.content_hash:
+                raise IdempotencyConflictError("同一 checkpoint sequence 已绑定不同内容")
+            return
         self._connection.execute(
-            "INSERT INTO checkpoint_metadata(id, run_id, sequence, checkpoint_ref, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO checkpoint_metadata(id, run_id, sequence, checkpoint_ref, content_hash, created_at, project_snapshot_id, sandbox_id, sandbox_image_digest, run_lease_epoch, phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 checkpoint.id,
                 str(checkpoint.run_id),
@@ -927,6 +948,11 @@ class RuntimeRepository:
                 checkpoint.checkpoint_ref,
                 checkpoint.content_hash,
                 _iso(checkpoint.created_at),
+                str(checkpoint.project_snapshot_id) if checkpoint.project_snapshot_id else None,
+                checkpoint.sandbox_id,
+                checkpoint.sandbox_image_digest,
+                checkpoint.run_lease_epoch,
+                checkpoint.phase,
             ),
         )
         self.append_event(
@@ -951,7 +977,58 @@ class RuntimeRepository:
             checkpoint_ref=row["checkpoint_ref"],
             content_hash=ContentHash(row["content_hash"]),
             created_at=_dt(row["created_at"]),
+            project_snapshot_id=(
+                SnapshotId(row["project_snapshot_id"]) if row["project_snapshot_id"] else None
+            ),
+            sandbox_id=row["sandbox_id"],
+            sandbox_image_digest=row["sandbox_image_digest"],
+            run_lease_epoch=row["run_lease_epoch"],
+            phase=RunPhase(row["phase"]) if row["phase"] else None,
         )
+
+    def count_retry_attempts(self, run_id: RunId) -> int:
+        """返回已持久化的自动重试次数，重启后仍以此值限制上限。"""
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM run_retry_attempts WHERE run_id = ?", (str(run_id),)
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def add_retry_attempt(self, retry: RetryRecord) -> RetryRecord:
+        """插入一次重试记录；相同 attempt 重放时返回已有事实。"""
+        existing = self._connection.execute(
+            "SELECT * FROM run_retry_attempts WHERE run_id = ? AND attempt = ?",
+            (str(retry.run_id), retry.attempt),
+        ).fetchone()
+        if existing is not None:
+            return RetryRecord(
+                run_id=RunId(existing["run_id"]),
+                attempt=existing["attempt"],
+                failure_kind=existing["failure_kind"],
+                delay_seconds=existing["delay_seconds"],
+                next_attempt_at=_dt(existing["next_attempt_at"]),
+                created_at=_dt(existing["created_at"]),
+            )
+        self._connection.execute(
+            "INSERT INTO run_retry_attempts(run_id, attempt, failure_kind, delay_seconds, next_attempt_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(retry.run_id),
+                retry.attempt,
+                retry.failure_kind,
+                retry.delay_seconds,
+                _iso(retry.next_attempt_at),
+                _iso(retry.created_at),
+            ),
+        )
+        self.append_event(
+            "run",
+            str(retry.run_id),
+            "RUN_RETRY_SCHEDULED",
+            retry.created_at,
+            {"attempt": retry.attempt, "failure_kind": retry.failure_kind},
+        )
+        return retry
 
     def reserve_idempotency(self, record: IdempotencyRecord) -> IdempotencyRecord:
         """首次调用占位；相同请求摘要重放返回原记录，不同摘要稳定冲突。"""
@@ -1033,6 +1110,7 @@ class RuntimeRepository:
             status=RunStatus(row["status"]),
             phase=RunPhase(row["phase"]),
             wait_reason=WaitReason(row["wait_reason"]) if row["wait_reason"] else None,
+            cancel_requested_at=_optional_dt(row["cancel_requested_at"]),
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
             completed_at=_optional_dt(row["completed_at"]),
