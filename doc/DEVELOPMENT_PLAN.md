@@ -25,7 +25,7 @@
 
 | Phase | Name | Primary modules | Depends on | Status | Completion report |
 |---:|---|---|---|---|---|
-| 00 | Engineering foundation | packaging, config, CI | — | NOT_STARTED | — |
+| 00 | Engineering foundation | packaging, config, CI | — | COMPLETED | [phase-00-foundation-20260813.md](phase-00-foundation-20260813.md) |
 | 01 | Domain model and state machines | domain | 00 | COMPLETED | [phase-01-domain-20260813.md](phase-01-domain-20260813.md) |
 | 02 | Runtime storage and durable primitives | storage | 01 | NOT_STARTED | — |
 | 03 | Project corpus, workspace, import and publication | projects, workspace, providers/workspace | 01–02 | NOT_STARTED | — |
