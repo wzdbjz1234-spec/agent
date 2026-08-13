@@ -152,24 +152,40 @@ class ExecutionRequest(BaseModel):
     code: str = Field(min_length=1, max_length=1_000_000)
     timeout_seconds: int = Field(gt=0)
     expected_output_names: tuple[str, ...] = ()
+    input_refs: tuple[str, ...] = ()
+    staging_ref: str | None = None
+    budget_units: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _validate_output_names(self) -> ExecutionRequest:
-        """输出名是 Step staging 内的叶子文件名，禁止借此注入目录或 Host 路径。"""
+        """输出名、输入引用和 staging 引用都不能携带 Host 路径。"""
         for name in self.expected_output_names:
             if not name or "/" in name or "\\" in name or name in {".", ".."}:
                 raise ValueError("输出名必须是 staging 内的单个文件名")
+        for reference in self.input_refs:
+            if not reference or "/" in reference or "\\" in reference or ".." in reference:
+                raise ValueError("输入引用必须是稳定的资源 ID")
+        if self.staging_ref is not None and (
+            not self.staging_ref.startswith("task:")
+            or "/" in self.staging_ref
+            or "\\" in self.staging_ref
+            or ".." in self.staging_ref
+        ):
+            raise ValueError("staging 引用必须是受控的 Task 资源引用")
         return self
 
 
 class ExecutionResult(BaseModel):
     """已截断的独立进程执行结果；完整结果只能经受控 staging 发布。"""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
 
     status: ExecutionStatus
     exit_code: int | None
     stdout: str
     stderr: str
     duration_ms: int = Field(ge=0)
+    output_schema: dict[str, object] = Field(default_factory=dict, alias="schema")
+    statistics: dict[str, int | float] = Field(default_factory=dict)
+    resource_stats: dict[str, int | float] = Field(default_factory=dict)
     process_id: str | None = None
