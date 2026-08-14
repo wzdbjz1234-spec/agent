@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dataharness.domain import Artifact, Dataset, Finding, Lineage
+
 
 class CreateProjectRequest(BaseModel):
     """创建 Project 的最小请求。"""
@@ -44,3 +46,23 @@ class ApiErrorResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     error: ApiErrorBody
+
+
+class TaskAnswer(BaseModel):
+    """Task 的最终结构化回答视图。
+
+    回答只由 Runtime 中的 Finding、正式资源和 lineage 组成；不把 Workspace 路径、
+    SQLite 行或模型原始消息直接暴露到 HTTP 边界。``disclosures`` 仅保存覆盖缺口等
+    稳定审计提示，调用方可以据此区分“已有结论”和“仍需人工复核”。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    task_status: str
+    run_ids: tuple[str, ...]
+    findings: tuple[Finding, ...]
+    datasets: tuple[Dataset, ...]
+    artifacts: tuple[Artifact, ...]
+    lineage: tuple[Lineage, ...]
+    disclosures: tuple[str, ...] = ()

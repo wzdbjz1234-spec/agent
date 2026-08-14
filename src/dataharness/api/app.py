@@ -213,4 +213,22 @@ def create_app(services: ApiService | None = None) -> FastAPI:
             item.model_dump(mode="json") for item in service.task_resources(task_id, "datasets")
         ]
 
+    @app.get("/tasks/{task_id}/findings")
+    async def task_findings(task_id: str):
+        """返回 Finding 状态和证据引用；原始模型消息不属于 API 回答。"""
+        return [item.model_dump(mode="json") for item in service.task_findings(task_id)]
+
+    @app.get("/findings/{finding_id}")
+    async def get_finding(finding_id: str):
+        return service.get_finding(finding_id).model_dump(mode="json")
+
+    @app.get("/tasks/{task_id}/lineage")
+    async def task_lineage(task_id: str):
+        return [item.model_dump(mode="json") for item in service.task_lineage(task_id)]
+
+    @app.get("/tasks/{task_id}/answer")
+    async def task_answer(task_id: str):
+        """返回稳定的最终回答 DTO，包含结论、正式资源、血缘和披露项。"""
+        return service.task_answer(task_id).model_dump(mode="json")
+
     return app

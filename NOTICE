@@ -1,0 +1,11 @@
+DataHarness V1
+Copyright (c) 2026 DataHarness contributors.
+
+This repository is released with the project-specific terms chosen by its maintainers.
+Third-party dependencies are not relicensed by this notice. Their license and notice
+requirements remain those declared by the corresponding package distributions and the
+locked dependency metadata in `uv.lock` and `sandbox-images/secure-analysis/requirements.lock`.
+
+The secure-analysis image contains Python runtime and the packages declared in its locked
+requirements file. The generated SPDX SBOM is the authoritative package inventory for a
+particular image digest; do not infer a license inventory from this short notice.

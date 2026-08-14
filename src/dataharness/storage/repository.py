@@ -368,6 +368,14 @@ class RuntimeRepository:
         ).fetchall()
         return tuple(self._run_from_row(row) for row in rows)
 
+    def list_findings_for_task(self, task_id: TaskId) -> tuple[Finding, ...]:
+        """按创建顺序返回 Task 的 Finding，供回答层复用同一事实源。"""
+        rows = self._connection.execute(
+            "SELECT id FROM findings WHERE task_id = ? ORDER BY created_at, id",
+            (str(task_id),),
+        ).fetchall()
+        return tuple(self.get_finding(FindingId(row["id"])).value for row in rows)
+
     def finalize_file_version(
         self, version: ProjectFileVersion, expected_version: int
     ) -> StoredRecord[ProjectFileVersion]:
@@ -961,6 +969,14 @@ class RuntimeRepository:
             ),
             created_at=_dt(row["created_at"]),
         )
+
+    def list_lineage_for_run(self, run_id: RunId) -> tuple[Lineage, ...]:
+        """返回一个 Run 的完整血缘边，回答层不需要拼接 SQL。"""
+        rows = self._connection.execute(
+            "SELECT id FROM lineage WHERE run_id = ? ORDER BY created_at, id",
+            (str(run_id),),
+        ).fetchall()
+        return tuple(self.get_lineage(LineageId(row["id"])) for row in rows)
 
     def add_checkpoint(self, checkpoint: CheckpointMetadata) -> None:
         existing = self._connection.execute(

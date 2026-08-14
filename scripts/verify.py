@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 COMMANDS: list[tuple[str, list[str]]] = [
     ("uv lock --check", ["uv", "lock", "--check"]),
+    ("release evidence structure", [sys.executable, "scripts/release_check.py"]),
     ("ruff format --check", ["uv", "run", "ruff", "format", "--check", "."]),
     ("ruff check", ["uv", "run", "ruff", "check", "."]),
     ("pyright", ["uv", "run", "pyright"]),

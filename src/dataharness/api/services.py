@@ -15,6 +15,7 @@ from dataharness.config import Settings
 from dataharness.domain import (
     FileId,
     FileVersionId,
+    FindingId,
     ProjectId,
     RunStatus,
     SessionId,
@@ -32,9 +33,10 @@ from dataharness.storage import (
     SqlitePublicationJournal,
     SqliteRuntimeStore,
 )
-from dataharness.workspace import UnsafePathError, WorkspaceBridge
+from dataharness.workspace import ResourceIntegrityError, UnsafePathError, WorkspaceBridge
 
 from .errors import ApiError
+from .models import TaskAnswer
 
 
 class ApiService:
@@ -61,6 +63,11 @@ class ApiService:
         self.observability = observability or OpenTelemetryAdapter()
         # 仅供 import_bytes 的临时源文件使用，不把路径暴露到 API DTO。
         self._workspace = workspace
+
+    @property
+    def workspace(self) -> LocalWorkspace | None:
+        """返回内部 Workspace 适配器，供本地 worker/E2E 装配复用。"""
+        return self._workspace
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ApiService:
@@ -122,7 +129,7 @@ class ApiService:
                 return self.corpus.import_file(
                     ProjectId(project_id), source, logical_name=safe_name
                 )
-        except OSError as error:
+        except (OSError, ResourceIntegrityError, UnsafePathError) as error:
             raise ApiError(400, "FILE_IMPORT_FAILED", "文件暂存失败") from error
 
     def list_files(self, project_id: str) -> tuple[ProjectFileView, ...]:
@@ -244,6 +251,70 @@ class ApiService:
             for run in uow.repo.list_runs_for_task(task_id_value):
                 events.extend(uow.repo.list_events("run", str(run.id)))
             return tuple(sorted(events, key=lambda item: (item.occurred_at, item.id)))
+
+    def task_findings(self, task_id: str):
+        """返回当前 Task 的 Finding，包括 DRAFT，供客户端显示验证状态。"""
+        task_id_value = TaskId(task_id)
+        with self.store.unit_of_work() as uow:
+            uow.repo.get_task(task_id_value)
+            return uow.repo.list_findings_for_task(task_id_value)
+
+    def get_finding(self, finding_id: str):
+        """通过稳定 Finding ID 查询正式结论，不读取 Workspace 原始输出。"""
+        with self.store.unit_of_work() as uow:
+            return uow.repo.get_finding(FindingId(finding_id)).value
+
+    def task_lineage(self, task_id: str):
+        """返回 Task 全部 Run 的 lineage，确保发布对象可追溯到当前 Run。"""
+        task_id_value = TaskId(task_id)
+        with self.store.unit_of_work() as uow:
+            uow.repo.get_task(task_id_value)
+            lineages = []
+            for run in uow.repo.list_runs_for_task(task_id_value):
+                lineages.extend(uow.repo.list_lineage_for_run(run.id))
+            # 同一边不会因排序查询重复；这里保持数据库的创建顺序并以 ID 去重。
+            return tuple({item.id: item for item in lineages}.values())
+
+    def task_answer(self, task_id: str) -> TaskAnswer:
+        """组装用户可见回答；覆盖告警从 Finding 事件中提取，不解析模型文本。"""
+        task_id_value = TaskId(task_id)
+        with self.store.unit_of_work() as uow:
+            task = uow.repo.get_task(task_id_value).value
+            runs = uow.repo.list_runs_for_task(task_id_value)
+            findings = uow.repo.list_findings_for_task(task_id_value)
+            datasets = tuple(
+                item
+                for item in uow.repo.list_project_datasets(task.project_id)
+                if item.task_id == task_id_value
+            )
+            artifacts = tuple(
+                item
+                for item in uow.repo.list_project_artifacts(task.project_id)
+                if item.task_id == task_id_value
+            )
+            lineages = []
+            for run in runs:
+                lineages.extend(uow.repo.list_lineage_for_run(run.id))
+            disclosures = {
+                "FULL_PROJECT 覆盖报告存在未覆盖文件": False,
+                "Finding 包含数据质量告警": False,
+            }
+            for finding in findings:
+                for event in uow.repo.list_events("finding", str(finding.id)):
+                    if event.event_type == "FINDING_COVERAGE_NOTICE":
+                        disclosures["FULL_PROJECT 覆盖报告存在未覆盖文件"] = True
+                    if event.event_type == "FINDING_DATA_WARNINGS":
+                        disclosures["Finding 包含数据质量告警"] = True
+        return TaskAnswer(
+            task_id=str(task.id),
+            task_status=str(task.status),
+            run_ids=tuple(str(run.id) for run in runs),
+            findings=findings,
+            datasets=datasets,
+            artifacts=artifacts,
+            lineage=tuple({item.id: item for item in lineages}.values()),
+            disclosures=tuple(message for message, present in disclosures.items() if present),
+        )
 
     def task_resources(self, task_id: str, kind: str):
         task_id_value = TaskId(task_id)

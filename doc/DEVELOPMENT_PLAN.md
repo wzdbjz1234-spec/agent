@@ -35,7 +35,7 @@
 | 07 | Durable orchestration and recovery | orchestration, providers/durable | 01–06 | COMPLETED | [phase-07-orchestration-20260814.md](phase-07-orchestration-20260814.md) |
 | 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | COMPLETED | [phase-08-agent-20260814-01.md](phase-08-agent-20260814-01.md) |
 | 09 | Verification, HTTP and observability | analysis, api, observability | 03–08 | COMPLETED | [phase-09-api-verification-20260814.md](phase-09-api-verification-20260814.md) |
-| 10 | E2E hardening and V1 release | all modules | 00–09 | NOT_STARTED | — |
+| 10 | E2E hardening and V1 release | all modules | 00–09 | COMPLETED | [phase-10-v1-release-20260814.md](phase-10-v1-release-20260814.md) |
 
 Critical path:
 
