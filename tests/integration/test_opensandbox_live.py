@@ -19,12 +19,32 @@ from pathlib import Path
 import pytest
 
 from dataharness.analysis import AnalysisRuntime, OutputSpec
-from dataharness.domain import ProjectId, Run, RunId, SnapshotId, StepId, Task, TaskId
+from dataharness.domain import (
+    ContentHash,
+    Project,
+    ProjectId,
+    ProjectSnapshot,
+    Run,
+    RunId,
+    SnapshotId,
+    StepId,
+    Task,
+    TaskId,
+    WaitReason,
+)
 from dataharness.idgen import DeterministicIdFactory
+from dataharness.orchestration import (
+    ExecutionDecision,
+    RecoveryDecision,
+    RunExecutionContext,
+    RunOutcome,
+    RunService,
+)
 from dataharness.projects import ProjectCorpus
+from dataharness.providers.durable import LocalDurableExecutor
 from dataharness.providers.sandbox import OpenSandboxProvider
 from dataharness.providers.sandbox.opensandbox_sdk import SdkOpenSandboxClient
-from dataharness.providers.workspace import LocalWorkspace
+from dataharness.providers.workspace import FakeWorkspace, LocalWorkspace
 from dataharness.sandbox import (
     ExecutionKind,
     ExecutionRequest,
@@ -36,6 +56,7 @@ from dataharness.sandbox import (
     SandboxSpec,
 )
 from dataharness.storage import (
+    CheckpointMetadata,
     RuntimeConnectionFactory,
     SqlitePublicationJournal,
     SqliteRuntimeStore,
@@ -332,3 +353,136 @@ async def test_live_analysis_runtime_runs_python_and_sql(live: LiveSandboxFixtur
     assert sql_summary.status == ExecutionStatus.SUCCEEDED
     assert "2" in sql_summary.stdout
     await provider.terminate(lease)
+
+
+@REQUIRES_LIVE
+@pytest.mark.asyncio
+async def test_live_durable_executor_rebuilds_checkpointed_sandbox(
+    live: LiveSandboxFixture,
+) -> None:
+    """真实耐久编排恢复同一 Run，并在 Sandbox 丢失后按原 Snapshot 重建。"""
+    T0 = datetime(2026, 1, 1, tzinfo=UTC)
+    runtime_dir = live.root / "orchestration-runtime"
+    runtime_dir.mkdir(parents=True)
+    factory = RuntimeConnectionFactory(runtime_dir / "runtime.db")
+    store = SqliteRuntimeStore(factory)
+    workspace = FakeWorkspace(runtime_dir / "workspace")
+
+    project = Project(id=live.project_id, name="live-orchestration", created_at=T0)
+    snapshot = ProjectSnapshot(id=live.snapshot_id, project_id=project.id, created_at=T0)
+    task = Task(id=live.task_id, project_id=project.id, created_at=T0, updated_at=T0)
+    run = Run(
+        id=live.run_id,
+        task_id=task.id,
+        project_id=project.id,
+        project_snapshot_id=snapshot.id,
+        created_at=T0,
+        updated_at=T0,
+    )
+    with store.unit_of_work() as uow:
+        uow.repo.add_project(project)
+        uow.repo.add_snapshot(snapshot)
+        uow.repo.add_task(task)
+        uow.repo.add_run(run)
+    workspace.create_task(project.id, task.id)
+
+    provider = live.provider()
+    calls: list[tuple[bool, RecoveryDecision, SnapshotId]] = []
+
+    async def handler(context: RunExecutionContext) -> RunOutcome:
+        """把一次真实 Sandbox Step 与可恢复 checkpoint 绑定。"""
+        assert context.sandbox_lease is not None
+        calls.append(
+            (context.recovered, context.recovery_decision, context.run.project_snapshot_id)
+        )
+        if len(calls) == 1:
+            result = await provider.execute(
+                context.sandbox_lease,
+                ExecutionRequest(
+                    step_id=StepId("step-before-wait"),
+                    kind=ExecutionKind.PYTHON,
+                    code="print('durable step committed')",
+                    timeout_seconds=20,
+                ),
+            )
+            assert result.status == ExecutionStatus.SUCCEEDED
+            checkpoint = CheckpointMetadata(
+                id="checkpoint-live-recovery",
+                run_id=context.run.id,
+                sequence=1,
+                checkpoint_ref="checkpoint:live-recovery",
+                content_hash=ContentHash("sha256:" + "a" * 64),
+                project_snapshot_id=context.run.project_snapshot_id,
+                sandbox_id=context.sandbox_lease.sandbox_id,
+                sandbox_image_digest=context.sandbox_lease.image_digest,
+                run_lease_epoch=context.lease_epoch,
+                phase=context.run.phase,
+                created_at=context.now,
+            )
+            return RunOutcome(
+                decision=ExecutionDecision.WAITING,
+                wait_reason=WaitReason.USER_INPUT,
+                checkpoint=checkpoint,
+            )
+
+        assert context.recovered
+        assert context.recovery_decision == RecoveryDecision.REBUILD_SANDBOX
+        result = await provider.execute(
+            context.sandbox_lease,
+            ExecutionRequest(
+                step_id=StepId("step-after-rebuild"),
+                kind=ExecutionKind.PYTHON,
+                code="print('durable recovery ok')",
+                timeout_seconds=20,
+            ),
+        )
+        assert result.status == ExecutionStatus.SUCCEEDED
+        assert "durable recovery ok" in result.stdout
+        return RunOutcome(decision=ExecutionDecision.SUCCEEDED)
+
+    def spec_factory(current_run: Run):
+        """恢复只能依据 Run 的固定 ID/Snapshot 生成新的 Sandbox 规格。"""
+        return live._make_spec(current_run.project_id, current_run.project_snapshot_id)
+
+    first_executor = LocalDurableExecutor(
+        store,
+        handler,
+        owner="live-worker-a",
+        clock=lambda: T0,
+        backoff_base=0,
+        sandbox=provider,
+        sandbox_spec_factory=spec_factory,
+        workspace=workspace,
+    )
+    first = await first_executor.run_once()
+    assert first is not None and first.status.value == "WAITING"
+    with store.unit_of_work() as uow:
+        checkpoint = uow.repo.latest_checkpoint(run.id)
+    assert checkpoint is not None
+    assert checkpoint.project_snapshot_id == snapshot.id
+
+    # WAITING 的 Sandbox 已由 Executor 终止；新的 worker 必须经历 connect 失败并重建。
+    with store.unit_of_work() as uow:
+        stored = uow.repo.get_run(run.id).value
+    assert stored.status.value == "WAITING"
+    RunService(store, clock=lambda: T0).resume(run.id)
+    second_executor = LocalDurableExecutor(
+        store,
+        handler,
+        owner="live-worker-b",
+        clock=lambda: T0,
+        backoff_base=0,
+        sandbox=provider,
+        sandbox_spec_factory=spec_factory,
+        workspace=workspace,
+    )
+    second = await second_executor.run_once()
+    with store.unit_of_work() as uow:
+        events = uow.repo.list_events("run", str(run.id))
+    assert second is not None and second.status.value == "SUCCEEDED", (
+        f"second={second!r}; calls={calls!r}; events={events!r}"
+    )
+    assert calls == [
+        (False, RecoveryDecision.START_FROM_BEGINNING, snapshot.id),
+        (True, RecoveryDecision.REBUILD_SANDBOX, snapshot.id),
+    ]

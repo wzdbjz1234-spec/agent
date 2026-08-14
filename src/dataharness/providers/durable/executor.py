@@ -24,7 +24,12 @@ from dataharness.orchestration.protocols import (
     RunHandler,
     SandboxSpecFactory,
 )
-from dataharness.sandbox import SandboxLease, SandboxLostError, SandboxProvider
+from dataharness.sandbox import (
+    SandboxLease,
+    SandboxLostError,
+    SandboxPolicyError,
+    SandboxProvider,
+)
 from dataharness.storage import CheckpointMetadata, ClaimedRun, LeaseLostError, SqliteRuntimeStore
 from dataharness.workspace import VirtualWorkspace
 
@@ -156,6 +161,13 @@ class LocalDurableExecutor:
     ) -> tuple[SandboxLease | None, RecoveryDecision]:
         if self._sandbox is None or self._sandbox_spec_factory is None:
             return None, decision
+        spec = self._sandbox_spec_factory(run)
+        if (
+            checkpoint is not None
+            and checkpoint.sandbox_image_digest is not None
+            and checkpoint.sandbox_image_digest != spec.image_digest
+        ):
+            raise PolicyDeniedError("checkpoint 的 Sandbox 镜像 digest 与恢复规格不一致")
         if decision == RecoveryDecision.RESUME_FROM_CHECKPOINT and checkpoint is not None:
             try:
                 lease = await self._sandbox.connect(checkpoint.sandbox_id or "")
@@ -171,13 +183,16 @@ class LocalDurableExecutor:
                 ):
                     raise PolicyDeniedError("恢复的 Sandbox lease 上下文与 Run 不一致")
                 return lease, decision
-            except SandboxLostError:
+            except (SandboxLostError, SandboxPolicyError):
+                # Provider 进程重启或旧 Sandbox 被销毁后，Provider 可能无法区分
+                # “远端丢失”与“本地没有已认证 lease”。两者都不能继续使用旧句柄；
+                # 先丢弃旧 lease，再按已经校验过的 Run/Snapshot/digest 规格重建。
                 decision = RecoveryDecision.REBUILD_SANDBOX
         if decision in (
             RecoveryDecision.START_FROM_BEGINNING,
             RecoveryDecision.REBUILD_SANDBOX,
         ):
-            return await self._sandbox.create(self._sandbox_spec_factory(run)), decision
+            return await self._sandbox.create(spec), decision
         return None, decision
 
     async def _commit_outcome(

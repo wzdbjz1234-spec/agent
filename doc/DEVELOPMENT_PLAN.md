@@ -32,8 +32,8 @@
 | 04 | Privacy and ModelGateway | privacy, hooks | 00–02 | COMPLETED | [phase-04-privacy-20260813.md](phase-04-privacy-20260813.md) |
 | 05 | OpenSandbox execution seam | sandbox, providers/sandbox, images | 00, 03 | COMPLETED | [phase-05-sandbox-20260813.md](phase-05-sandbox-20260813.md) + [addendum-20260814](phase-05-sandbox-20260814-addendum-01.md) |
 | 06 | Analysis runtime and agent capabilities | analysis, capabilities | 01–05 | COMPLETED | [phase-06-analysis-20260813.md](phase-06-analysis-20260813.md) + [复验-20260814](phase-06-analysis-20260814.md) |
-| 07 | Durable orchestration and recovery | orchestration, providers/durable | 01–06 | IN_PROGRESS | [phase-07-orchestration-20260813.md](phase-07-orchestration-20260813.md) |
-| 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | IN_PROGRESS | [phase-08-agent-20260814.md](phase-08-agent-20260814.md) |
+| 07 | Durable orchestration and recovery | orchestration, providers/durable | 01–06 | COMPLETED | [phase-07-orchestration-20260814.md](phase-07-orchestration-20260814.md) |
+| 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | COMPLETED | [phase-08-agent-20260814-01.md](phase-08-agent-20260814-01.md) |
 | 09 | Verification, HTTP and observability | analysis, api, observability | 03–08 | NOT_STARTED | — |
 | 10 | E2E hardening and V1 release | all modules | 00–09 | NOT_STARTED | — |
 
