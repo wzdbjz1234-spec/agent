@@ -318,11 +318,19 @@ submit_finding
 
 ### 8.4 安全配置
 
-- 固定且锁定 digest 的分析镜像。
-- 默认网络完全关闭，V1 不允许 Agent 临时开放网络。
-- Sandbox 无 Host 凭据、Runtime DB、Privacy DB、Docker socket 或额外 Host 路径。
+- 固定且锁定 digest 的分析镜像；创建请求只携带 `<runtime>@sha256:<digest>`，docker daemon 无法解析未锁定镜像。
+- 默认网络完全关闭（deny-all egress 策略，无放行规则），V1 不允许 Agent 临时开放网络。
+- Sandbox 无 Host 凭据、Runtime DB、Privacy DB、Docker socket 或额外 Host 路径；Host 路径只存在于部署装配层的 mount resolver，SDK 请求只携带受控 resource 引用。
 - CPU、内存、磁盘、进程、执行时间和输出大小均有限制。
 - 开发环境可放宽配置，但 `secure-analysis` 是默认配置。
+
+`root_read_only` 的 V1 语义是「根文件系统对执行用户不可写」：官方 OpenSandbox docker
+后端不提供只读根挂载，等价保证由非 root `sandbox` 用户（uid 10001）+
+`no_new_privileges` + drop capabilities（CapEff=0）提供。`OpenSandboxProvider` 的
+attestation 在创建和重连时用有界运行时探测验证：user/uid、NoNewPrivs、CapEff、
+根目录可写性、出站网络连通性、三项挂载的存在性与读写性、cgroup 内存上限；
+任何一项与 `SandboxSpec` 不符都 fail closed，不静默降级。镜像 digest 在创建时由
+docker daemon 对 digest 引用的解析强制，重连时通过与创建元数据（metadata 回写）比对复核。
 
 ## 9. 数据入口与数据库边界
 

@@ -76,6 +76,8 @@ class SandboxConfig(BaseModel):
     runtime: str = "secure-analysis"
     image_digest: str | None = None
     network_enabled: bool = False
+    # OpenSandbox 服务端 API Key；为空表示本地自托管服务不启用认证
+    api_key: str | None = None
 
     @model_validator(mode="after")
     def _reject_network(self) -> SandboxConfig:

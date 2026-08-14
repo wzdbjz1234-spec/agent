@@ -2,3 +2,5 @@
 # 安装只允许在镜像构建阶段发生，运行期不提供 pip/conda/apt 能力。
 duckdb==1.5.5
 pyarrow==25.0.1
+pandas==2.2.3
+pandera==0.21.1

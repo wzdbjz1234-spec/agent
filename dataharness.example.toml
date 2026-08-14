@@ -18,6 +18,8 @@ endpoint = "http://127.0.0.1:8080"
 runtime = "secure-analysis"
 # 生产环境必须锁定镜像 digest（如 "sha256:..."）；此处省略表示待锁定
 network_enabled = false
+# 本地自托管 OpenSandbox 服务可不认证；生产环境经环境变量注入
+# api_key = "..."
 
 [extraction]
 max_file_bytes = 104857600

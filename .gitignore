@@ -16,3 +16,6 @@ htmlcov/
 
 # uv
 uv.lock.tmp
+
+# Runtime data root（项目默认数据目录，与 dataharness.example.toml 一致）
+runtime-data/

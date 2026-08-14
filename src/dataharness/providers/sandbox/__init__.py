@@ -2,10 +2,12 @@
 
 from .fake import FakeExecutionPlan, FakeSandboxProvider
 from .opensandbox import OpenSandboxClient, OpenSandboxProvider
+from .opensandbox_sdk import SdkOpenSandboxClient
 
 __all__ = [
     "FakeExecutionPlan",
     "FakeSandboxProvider",
     "OpenSandboxClient",
     "OpenSandboxProvider",
+    "SdkOpenSandboxClient",
 ]

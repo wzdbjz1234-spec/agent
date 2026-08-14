@@ -12,6 +12,7 @@ dependencies = [
     "python-docx>=1.1",
     "python-pptx>=1.0",
     "pydantic-ai>=2.29.0",
+    "opensandbox>=0.1.15",
 ]
 
 [project.scripts]

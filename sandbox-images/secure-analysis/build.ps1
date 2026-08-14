@@ -1,10 +1,15 @@
 <#
 .SYNOPSIS
-构建并记录 secure-analysis 的可审计镜像证据。
+Build and record auditable image evidence for secure-analysis.
 
 .DESCRIPTION
-该脚本拒绝可变 tag 和未锁定的 base image。Docker、SBOM 与漏洞扫描工具并不在源码中
-伪造；调用后须将实际 digest、SBOM 和扫描结果写入 build-evidence/，再由阶段验收引用。
+Refuses mutable tags and unlocked base images. Docker, SBOM and vulnerability
+scanners are never faked in source; callers must write the actual digest, SBOM
+and scan results into build-evidence/ for phase acceptance to reference.
+
+NOTE: keep this file ASCII-only. PowerShell 5.1 reads BOM-less .ps1 as ANSI,
+and the edit tool does not preserve a UTF-8 BOM, so non-ASCII text in this
+script breaks parsing on this platform.
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -17,16 +22,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    throw 'Docker 不可用；拒绝把未经构建和扫描的镜像声明为 secure-analysis。'
+    throw 'Docker is unavailable; refusing to claim an unbuilt image as secure-analysis.'
 }
 
-docker build --pull --build-arg "BASE_IMAGE=$BaseImage" --tag $Tag $PSScriptRoot
+# PowerShell 5.1 treats native stderr as ErrorRecords: docker build progress goes
+# to stderr and would be mistaken for a terminating error under 'Stop'. Route the
+# command through cmd /c with file redirection so stderr never enters the
+# PowerShell error stream, then judge success by the exit code.
+$buildLog = Join-Path $env:TEMP 'secure-analysis-build.log'
+& cmd.exe /c "docker build --pull --build-arg `"BASE_IMAGE=$BaseImage`" --tag $Tag `"$PSScriptRoot`" > `"$buildLog`" 2>&1"
+$buildExit = $LASTEXITCODE
+Get-Content $buildLog | Write-Output
+if ($buildExit -ne 0) {
+    throw "docker build failed (exit $buildExit). See $buildLog"
+}
 $digest = docker image inspect $Tag --format '{{index .RepoDigests 0}}'
 if ($digest -notmatch '@sha256:[0-9a-f]{64}$') {
-    throw '构建结果未返回锁定 digest。'
+    throw 'Build result did not return a locked digest.'
 }
+# Record the bare content digest; SandboxSpec.image_digest requires "sha256:...".
+$digest = $digest.Substring($digest.IndexOf('@') + 1)
 
 $evidence = Join-Path $PSScriptRoot 'build-evidence'
 New-Item -ItemType Directory -Force -Path $evidence | Out-Null
-Set-Content -NoNewline -Encoding utf8 -Path (Join-Path $evidence 'image-digest.txt') -Value $digest
-Write-Output "已构建 $digest。请使用部署批准的 SBOM 和漏洞扫描器将结果写入 $evidence。"
+Set-Content -NoNewline -Encoding ascii -Path (Join-Path $evidence 'image-digest.txt') -Value $digest
+Write-Output "Built $digest. Write SBOM and vulnerability scan results into $evidence."
