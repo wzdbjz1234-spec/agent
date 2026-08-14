@@ -33,7 +33,7 @@
 | 05 | OpenSandbox execution seam | sandbox, providers/sandbox, images | 00, 03 | IN_PROGRESS | — |
 | 06 | Analysis runtime and agent capabilities | analysis, capabilities | 01–05 | IN_PROGRESS | [phase-06-analysis-20260813.md](phase-06-analysis-20260813.md) |
 | 07 | Durable orchestration and recovery | orchestration, providers/durable | 01–06 | BLOCKED | [phase-07-orchestration-20260813.md](phase-07-orchestration-20260813.md) |
-| 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | NOT_STARTED | — |
+| 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | BLOCKED | [phase-08-agent-20260814.md](phase-08-agent-20260814.md) |
 | 09 | Verification, HTTP and observability | analysis, api, observability | 03–08 | NOT_STARTED | — |
 | 10 | E2E hardening and V1 release | all modules | 00–09 | NOT_STARTED | — |
 
