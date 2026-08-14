@@ -49,6 +49,22 @@ class VirtualWorkspace(Protocol):
         self, project_id: ProjectId, task_id: TaskId, name: str, data: bytes
     ) -> WorkspaceResource: ...
 
+    def read_task_state(
+        self, project_id: ProjectId, task_id: TaskId, name: str, max_bytes: int = 10 * 1024 * 1024
+    ) -> bytes: ...
+
+    def write_task_checkpoint(
+        self, project_id: ProjectId, task_id: TaskId, sequence: int, data: bytes
+    ) -> WorkspaceResource: ...
+
+    def read_task_checkpoint(
+        self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        sequence: int,
+        max_bytes: int = 10 * 1024 * 1024,
+    ) -> bytes: ...
+
     def staging_path(
         self, project_id: ProjectId, task_id: TaskId, step_id: StepId, output_name: str
     ) -> Path: ...

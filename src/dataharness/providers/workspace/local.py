@@ -263,6 +263,76 @@ class LocalWorkspace:
             byte_size=len(data),
         )
 
+    def read_task_state(
+        self, project_id: ProjectId, task_id: TaskId, name: str, max_bytes: int = 10 * 1024 * 1024
+    ) -> bytes:
+        """只从受控 Task state 目录读取文件，并限制单次读取大小。"""
+        if name not in {"PLAN.md", "PROGRESS.md", "CONTEXT.md", "RUN.json"}:
+            raise UnsafePathError("Task state 只允许读取固定清单文件")
+        if max_bytes <= 0:
+            raise ValueError("max_bytes 必须为正数")
+        target = self._within(project_id, "tasks", task_id, "state", name, must_exist=True)
+        if target.is_symlink() or not target.is_file():
+            raise UnsafePathError("Task state 必须是普通文件")
+        if target.stat().st_size > max_bytes:
+            raise ResourceIntegrityError(f"Task state 超过 {max_bytes} 字节读取上限")
+        return target.read_bytes()
+
+    @staticmethod
+    def _checkpoint_name(sequence: int) -> str:
+        """把 checkpoint 序列号转换成不含路径语义的文件名。"""
+        if sequence <= 0:
+            raise ValueError("checkpoint sequence 必须为正数")
+        return f"checkpoint-{sequence}.json"
+
+    def write_task_checkpoint(
+        self, project_id: ProjectId, task_id: TaskId, sequence: int, data: bytes
+    ) -> WorkspaceResource:
+        """以独立文件原子保存 checkpoint，避免覆盖之前可恢复的版本。"""
+        self.create_task(project_id, task_id)
+        name = self._checkpoint_name(sequence)
+        target = self._within(project_id, "tasks", task_id, "state", "checkpoints", name)
+        target.parent.mkdir(exist_ok=True)
+        if target.exists() and compute_content_hash(target.read_bytes()) != compute_content_hash(
+            data
+        ):
+            raise ResourceIntegrityError("同一 checkpoint sequence 已存在不同内容")
+        if not target.exists():
+            self._atomic_write(target, data)
+        return WorkspaceResource(
+            project_id=project_id,
+            namespace="checkpoints",
+            resource_id=str(task_id),
+            name=name,
+            content_hash=compute_content_hash(data),
+            byte_size=len(data),
+        )
+
+    def read_task_checkpoint(
+        self,
+        project_id: ProjectId,
+        task_id: TaskId,
+        sequence: int,
+        max_bytes: int = 10 * 1024 * 1024,
+    ) -> bytes:
+        """读取指定 checkpoint，并拒绝符号链接或超限文件。"""
+        if max_bytes <= 0:
+            raise ValueError("max_bytes 必须为正数")
+        target = self._within(
+            project_id,
+            "tasks",
+            task_id,
+            "state",
+            "checkpoints",
+            self._checkpoint_name(sequence),
+            must_exist=True,
+        )
+        if target.is_symlink() or not target.is_file():
+            raise UnsafePathError("checkpoint 必须是普通文件")
+        if target.stat().st_size > max_bytes:
+            raise ResourceIntegrityError(f"checkpoint 超过 {max_bytes} 字节读取上限")
+        return target.read_bytes()
+
     def staging_path(
         self, project_id: ProjectId, task_id: TaskId, step_id: StepId, output_name: str
     ) -> Path:
