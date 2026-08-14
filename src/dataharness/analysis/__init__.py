@@ -19,6 +19,17 @@ from .models import (
     ProjectFileView,
 )
 from .runtime import AnalysisRuntime
+from .verification import (
+    EvidenceGate,
+    ExecutionGate,
+    FindingVerificationResult,
+    GateName,
+    GateReport,
+    IntegrityGate,
+    VerificationError,
+    VerificationService,
+)
+from .warnings import DataWarning, DataWarningDetector, DataWarningKind
 
 __all__ = [
     "AnalysisBudgetError",
@@ -28,6 +39,15 @@ __all__ = [
     "AnalysisMode",
     "AnalysisRequest",
     "AnalysisRuntime",
+    "DataWarning",
+    "DataWarningDetector",
+    "DataWarningKind",
+    "EvidenceGate",
+    "ExecutionGate",
+    "FindingVerificationResult",
+    "GateName",
+    "GateReport",
+    "IntegrityGate",
     "AnalysisSummary",
     "FullProjectResult",
     "InputReference",
@@ -36,4 +56,6 @@ __all__ = [
     "OutputSpec",
     "ProjectFileInspection",
     "ProjectFileView",
+    "VerificationError",
+    "VerificationService",
 ]

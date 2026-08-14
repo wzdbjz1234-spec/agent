@@ -13,6 +13,7 @@ from dataharness.domain import (
     Artifact,
     ArtifactId,
     ContentHash,
+    CoverageReportId,
     Dataset,
     DatasetId,
     EvidenceKind,
@@ -679,6 +680,20 @@ class AnalysisRuntime:
 
     def submit_finding(self, summary: str, evidence: tuple[EvidenceRef, ...]) -> Finding:
         """提交 DRAFT FindingCandidate；正式验证由后续 Host Gate 负责。"""
+        return self.submit_finding_with_coverage(summary, evidence)
+
+    def submit_finding_with_coverage(
+        self,
+        summary: str,
+        evidence: tuple[EvidenceRef, ...],
+        *,
+        coverage_report_id: str | None = None,
+    ) -> Finding:
+        """提交带可选覆盖报告引用的 Finding 草稿。
+
+        Agent 仍只能得到 ``DRAFT``；CoverageReport 只是 FULL_PROJECT 的事实引用，
+        是否允许晋级为正式 Finding 仍必须经过 Host VerificationService 的三道 Gate。
+        """
         _, run_id, _, snapshot_id = self._context()
         if not summary.strip() or len(summary) > self._max_summary_chars:
             raise AnalysisContextError("Finding 摘要必须是有界非空文本")
@@ -722,6 +737,9 @@ class AnalysisRuntime:
             project_snapshot_id=snapshot_id,
             summary=summary,
             evidence=evidence,
+            coverage_report_id=(
+                CoverageReportId(coverage_report_id) if coverage_report_id else None
+            ),
             created_at=self._clock(),
         )
         finding = Finding(id=FindingId(self._ids.new("finding")), candidate=candidate)

@@ -184,6 +184,20 @@ class RuntimeRepository:
         )
         self.append_event("project", str(project.id), "PROJECT_CREATED", project.created_at)
 
+    def list_projects(self) -> tuple[Project, ...]:
+        """按创建时间返回项目窄视图，供本地控制面展示，不暴露 SQL 行。"""
+        rows = self._connection.execute("SELECT * FROM projects ORDER BY created_at, id").fetchall()
+        return tuple(
+            Project(
+                id=ProjectId(row["id"]),
+                name=row["name"],
+                status=ProjectStatus(row["status"]),
+                created_at=_dt(row["created_at"]),
+                archived_at=_optional_dt(row["archived_at"]),
+            )
+            for row in rows
+        )
+
     def get_project(self, project_id: ProjectId) -> StoredRecord[Project]:
         row = _required(
             self._connection.execute(
@@ -338,6 +352,21 @@ class RuntimeRepository:
             (str(project_id),),
         ).fetchall()
         return tuple(self.get_dataset(DatasetId(row["id"])) for row in rows)
+
+    def list_project_artifacts(self, project_id: ProjectId) -> tuple[Artifact, ...]:
+        """列出项目正式 Artifact；文件内容仍由 Workspace 发布事实校验。"""
+        rows = self._connection.execute(
+            "SELECT id FROM artifacts WHERE project_id = ? ORDER BY created_at, id",
+            (str(project_id),),
+        ).fetchall()
+        return tuple(self.get_artifact(ArtifactId(row["id"])) for row in rows)
+
+    def list_runs_for_task(self, task_id: TaskId) -> tuple[Run, ...]:
+        """返回 Task 的 Run 元数据，供取消、恢复和事件查询选择正确聚合。"""
+        rows = self._connection.execute(
+            "SELECT * FROM runs WHERE task_id = ? ORDER BY created_at, id", (str(task_id),)
+        ).fetchall()
+        return tuple(self._run_from_row(row) for row in rows)
 
     def finalize_file_version(
         self, version: ProjectFileVersion, expected_version: int
@@ -795,7 +824,7 @@ class RuntimeRepository:
     def add_finding(self, finding: Finding) -> None:
         candidate = finding.candidate
         self._connection.execute(
-            "INSERT INTO findings(id, task_id, run_id, project_snapshot_id, summary, status, created_at, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO findings(id, task_id, run_id, project_snapshot_id, summary, status, created_at, verified_at, coverage_report_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(finding.id),
                 str(candidate.task_id),
@@ -805,6 +834,7 @@ class RuntimeRepository:
                 finding.status,
                 _iso(candidate.created_at),
                 _iso(finding.verified_at),
+                str(candidate.coverage_report_id) if candidate.coverage_report_id else None,
             ),
         )
         self._connection.executemany(
@@ -840,6 +870,9 @@ class RuntimeRepository:
             run_id=RunId(row["run_id"]),
             project_snapshot_id=SnapshotId(row["project_snapshot_id"]),
             summary=row["summary"],
+            coverage_report_id=(
+                CoverageReportId(row["coverage_report_id"]) if row["coverage_report_id"] else None
+            ),
             evidence=tuple(
                 EvidenceRef(
                     kind=EvidenceKind(item["kind"]),

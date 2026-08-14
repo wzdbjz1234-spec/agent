@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .clock import utcnow
 from .enums import FindingStatus
 from .errors import InvalidEvidenceError
-from .ids import ContentHash, FindingId, RunId, SnapshotId, TaskId
+from .ids import ContentHash, CoverageReportId, FindingId, RunId, SnapshotId, TaskId
 from .state_machine import check_transition
 
 
@@ -49,6 +49,8 @@ class FindingCandidate(BaseModel):
     project_snapshot_id: SnapshotId
     summary: str
     evidence: tuple[EvidenceRef, ...]
+    # FULL_PROJECT 结论必须把覆盖事实作为结构化引用持久化，不能只在自然语言中声称“已全量分析”。
+    coverage_report_id: CoverageReportId | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
     @model_validator(mode="after")
