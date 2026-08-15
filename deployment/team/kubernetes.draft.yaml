@@ -1,0 +1,77 @@
+# Phase 14 design-only Kubernetes draft. All Deployments have zero replicas and no Ingress.
+# It documents intended service accounts, network separation, and secret references only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dataharness-team-design
+  annotations:
+    dataharness.io/status: "design-only-not-authorized-for-shared-access"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dataharness-api
+  namespace: dataharness-team-design
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dataharness-worker
+  namespace: dataharness-team-design
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: dataharness-team-design
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: dataharness-api}
+  template:
+    metadata:
+      labels: {app: dataharness-api}
+    spec:
+      serviceAccountName: dataharness-api
+      containers:
+        - name: api
+          image: REQUIRED_APPROVED_IMMUTABLE_API_IMAGE
+          env:
+            - name: DATAHARNESS_AUTH_MODE
+              value: oidc
+            - name: DATABASE_DSN
+              valueFrom:
+                secretKeyRef: {name: external-secret-reference, key: database-dsn}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: dataharness-team-design
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: dataharness-worker}
+  template:
+    metadata:
+      labels: {app: dataharness-worker}
+    spec:
+      serviceAccountName: dataharness-worker
+      containers:
+        - name: worker
+          image: REQUIRED_APPROVED_IMMUTABLE_WORKER_IMAGE
+          env:
+            - name: DATAHARNESS_QUEUE
+              value: durable-queue
+            - name: MODEL_GATEWAY_CREDENTIAL
+              valueFrom:
+                secretKeyRef: {name: external-secret-reference, key: model-gateway}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: dataharness-team-design
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]

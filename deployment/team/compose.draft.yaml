@@ -1,0 +1,51 @@
+# Phase 14 design-only Compose draft. It is deliberately non-deployable:
+# required image variables have no defaults, secrets are external, and no ports are published.
+name: dataharness-team-draft
+
+x-phase14:
+  status: "design-only; no shared deployment authorization"
+  prerequisites: "OIDC, RBAC, tenant isolation, TLS edge, secret manager, migration and security gates"
+
+services:
+  api:
+    image: ${DATAHARNESS_API_IMAGE:?Phase14 draft only; provide an approved immutable image after security gates}
+    profiles: [design-only]
+    environment:
+      DATAHARNESS_RUNTIME_STORE: postgres
+      DATAHARNESS_WORKSPACE: object-storage
+      DATAHARNESS_AUTH_MODE: oidc
+    secrets: [database_dsn, oidc_config]
+    networks: [control]
+
+  worker:
+    image: ${DATAHARNESS_WORKER_IMAGE:?Phase14 draft only; provide an approved immutable image after security gates}
+    profiles: [design-only]
+    environment:
+      DATAHARNESS_RUNTIME_STORE: postgres
+      DATAHARNESS_WORKSPACE: object-storage
+      DATAHARNESS_QUEUE: durable-queue
+    secrets: [database_dsn, model_gateway_credential, object_storage_credential]
+    networks: [control, sandbox]
+
+  sandbox-control:
+    image: ${OPENSANDBOX_CONTROL_IMAGE:?Phase14 draft only; use an approved immutable image after security gates}
+    profiles: [design-only]
+    networks: [sandbox]
+
+networks:
+  control:
+    internal: true
+  sandbox:
+    internal: true
+
+secrets:
+  # Names document intended scopes only. Values must come from an external secret manager,
+  # never from this file, environment interpolation, ConfigMap, or source control.
+  database_dsn:
+    external: true
+  oidc_config:
+    external: true
+  model_gateway_credential:
+    external: true
+  object_storage_credential:
+    external: true
