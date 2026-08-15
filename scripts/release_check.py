@@ -17,6 +17,7 @@ EVIDENCE_ROOT = REPO_ROOT / "sandbox-images" / "secure-analysis" / "build-eviden
 REQUIRED_FILES = (
     "AGENT.md",
     "ARCHITECTURE.md",
+    "README.md",
     "dataharness.example.toml",
     "NOTICE",
     "pyproject.toml",

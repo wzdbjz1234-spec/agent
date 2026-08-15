@@ -1,0 +1,410 @@
+# DataHarness
+
+DataHarness 是一个本地优先的数据分析 Agent Harness：Project 文件在本地版本化保存，Task/Run/Step 状态写入 Runtime SQLite，生成的 Python/SQL 只允许进入 OpenSandbox，模型请求统一经过 ModelGateway 的 secret/PII 边界。
+
+当前版本是 V1 本地控制面和 Sandbox 验收工程，默认单机、单租户、仅回环地址。它不是公网生产服务，也不是已经打包好的 docker compose up 一键产品。下面的流程以 Windows PowerShell 为例，Linux/macOS 只需要替换路径和环境变量语法。
+
+## 1. 当前可用范围
+
+已实现并验证：
+
+- 本地 FastAPI 控制面：Project、文件导入/版本/检索、Task、事件、Dataset、Artifact、Finding、lineage 和最终 answer 查询；
+- Runtime SQLite、每 Task 独立 Privacy SQLite、本地 Project/Task Workspace；
+- OpenSandbox Python SDK Adapter、固定 digest 镜像、默认断网、只读 ProjectSnapshot；
+- LocalDurableExecutor 的 lease、重试、取消、Host crash 恢复和 Sandbox 重建；
+- PydanticAI Agent、ModelGateway、PII placeholder、Finding Verification Gate；
+- CSV、Parquet、Excel、JSON、PDF、DOCX、PPTX、Markdown、TXT 等受支持格式的导入链路。
+
+当前限制，部署前必须了解：
+
+1. dataharness serve 当前只启动 API 控制面，不会自动启动 Worker，也不会自动执行 Agent Run。
+2. ModelProviderConfig 已有 provider/model/api_key_env/base_url 字段，但仓库当前没有 OpenAI/Anthropic 的生产 Provider 装配。测试使用 fake cloud；仅设置 API Key 不会让 serve 自动访问真实 LLM。
+3. 当前 API 没有 POST /projects/{project_id}/snapshots 路由，创建 Snapshot 需要通过 ProjectCorpus 的本地 Python 调用完成。
+4. V1 不提供公网认证、TLS、RBAC、多租户、Webhook、在线数据库、通用 shell 或运行时安装依赖。
+
+完整运维约束见 [doc/V1_OPERATIONS.md](doc/V1_OPERATIONS.md)，阶段验收证据见 [doc/phase-10-v1-release-20260814.md](doc/phase-10-v1-release-20260814.md)。
+
+## 2. 运行架构
+
+    浏览器/客户端
+          │ HTTP，仅 127.0.0.1:8000
+          ▼
+    FastAPI API（当前可直接启动）
+          │
+          ├── Runtime SQLite：Task/Run/Step/事件/队列/资源元数据
+          ├── Privacy SQLite：每 Task 的 PII 映射，与 Runtime 分离
+          ├── LocalWorkspace：Project sources、索引、Task working/staging
+          └── ProjectCorpus：提取、Snapshot、FTS5/BM25 检索
+
+    独立的 OpenSandbox Server（127.0.0.1:8080，Docker backend）
+          └── secure-analysis@sha256:<digest>
+              ├── /project：当前 Snapshot，只读
+              ├── /task/working：当前 Task，可写
+              └── /task/staging：当前 Task，可写
+
+Runtime DB、Privacy DB、凭据和 Docker socket 不得挂载进 Sandbox。所有生成代码都被视为不可信数据，只能由 OpenSandbox 执行，Host 不使用 exec/eval 执行模型代码。
+
+## 3. 环境要求
+
+必须安装：
+
+- Python 3.12 或更高版本；
+- uv；
+- Docker Desktop / Docker Engine，并确认 Docker daemon 正常运行；
+- 真实 Sandbox 验收需要 uvx 能安装 opensandbox-server==0.2.2；
+- 真实镜像 SBOM 需要 Docker Scout CLI plugin；漏洞扫描脚本访问 OSV API。
+
+检查环境：
+
+    python --version
+    uv --version
+    docker version
+    docker info
+
+## 4. 获取代码并安装依赖
+
+在仓库根目录 C:\projects\research 执行：
+
+    uv sync --locked
+
+uv.lock 是依赖事实源。不要使用 pip install -r 替代锁文件安装，也不要在 secure-analysis 运行期安装 Python 包。
+
+安装后确认命令可用：
+
+    uv run dataharness --version
+    uv run dataharness check
+
+## 5. 准备配置和数据目录
+
+复制配置样例为本地配置。该文件不要提交到 Git；真实 API Key 仍应通过环境变量提供。
+
+    Copy-Item .\dataharness.example.toml .\dataharness.local.toml
+
+推荐在 dataharness.local.toml 中至少确认以下内容：
+
+    [paths]
+    runtime_data_root = "runtime-data"
+
+    [model]
+    provider = "openai"
+    model = "gpt-4o-mini"
+    api_key_env = "DATAHARNESS_MODEL_API_KEY"
+    # base_url = "https://api.openai.com/v1"
+
+    [sandbox]
+    endpoint = "http://127.0.0.1:8080"
+    runtime = "secure-analysis"
+    network_enabled = false
+
+路径会派生为：
+
+    runtime-data/runtime.db       Runtime SQLite
+    runtime-data/privacy/          每 Task Privacy SQLite
+    runtime-data/projects/         Project Workspace
+    runtime-data/live-sandbox/     live 测试临时挂载目录
+
+校验配置：
+
+    uv run dataharness check --config .\dataharness.local.toml
+
+注意：当前 model 配置主要用于声明和校验，真实模型 Provider 尚未由 serve 自动装配。
+
+## 6. 构建 secure-analysis 镜像
+
+OpenSandbox 必须使用不可变镜像 digest，不能直接使用 secure-analysis:latest 或未锁定的基础镜像标签。
+
+### 6.1 准备带 digest 的基础镜像
+
+如果本机已经有带 digest 的基础镜像，查询其完整引用：
+
+    docker image inspect dockerproxy.net/library/python:3.12-slim --format '{{index .RepoDigests 0}}'
+
+输出应类似：
+
+    dockerproxy.net/library/python:3.12-slim@sha256:<64 位小写十六进制>
+
+如果没有镜像，先拉取一个受信任镜像源，再重新查询 digest：
+
+    docker pull dockerproxy.net/library/python:3.12-slim
+
+### 6.2 构建并记录 digest
+
+将上一步的完整输出填入 BaseImage：
+
+    .\sandbox-images\secure-analysis\build.ps1 -BaseImage "dockerproxy.net/library/python:3.12-slim@sha256:<64 位小写十六进制>" -Tag "secure-analysis:1.0.0"
+
+脚本会：
+
+- 拒绝未锁定的基础镜像；
+- 安装 sandbox-images/secure-analysis/requirements.lock 中的依赖；
+- 删除运行期 pip 和缓存；
+- 创建非 root sandbox 用户；
+- 写入 sandbox-images/secure-analysis/build-evidence/image-digest.txt。
+
+### 6.3 生成 SBOM 和漏洞扫描证据
+
+build-evidence 被 .gitignore 忽略，因为证据必须绑定实际构建结果。每次镜像或依赖变化都要重新生成：
+
+    docker scout version
+    docker scout sbom secure-analysis:1.0.0 --format json | Out-File -Encoding utf8 .\sandbox-images\secure-analysis\build-evidence\sbom.spdx.json
+
+    uv run python .\sandbox-images\secure-analysis\scan_vulns.py .\sandbox-images\secure-analysis\build-evidence\sbom.spdx.json .\sandbox-images\secure-analysis\build-evidence\vuln-scan.json
+
+发布前检查：
+
+    uv run python scripts/release_check.py --require-image
+
+漏洞扫描发现漏洞并不代表脚本失败；必须阅读 vuln-scan.json，记录风险、是否有上游修复以及是否接受风险。不能删除或伪造扫描结果。
+
+## 7. 配置并启动 OpenSandbox Server
+
+OpenSandbox Server 不随本项目的 FastAPI 进程自动启动。它是独立服务，使用 Docker backend 创建分析 Sandbox。
+
+### 7.1 服务配置文件
+
+建议在用户目录创建：
+
+    C:\Users\<用户名>\.sandbox.toml
+
+最少需要确认这些配置：
+
+    [server]
+    host = "127.0.0.1"
+    port = 8080
+
+    [runtime]
+    type = "docker"
+    execd_image = "<已验证的 opensandbox/execd 镜像引用>"
+
+    [storage]
+    allowed_host_paths = ["C:/projects/research/runtime-data"]
+
+    [docker]
+    network_mode = "bridge"
+    no_new_privileges = true
+    pids_limit = 4096
+
+    [egress]
+    mode = "dns+nft"
+    image = "<已验证的 opensandbox/egress 镜像引用>"
+
+allowed_host_paths 只允许项目需要的 Workspace 根目录，不要填写整个用户目录、根目录或包含凭据的目录。dns+nft 很重要：只使用 dns 模式可能允许直连 IP 的非 53 端口流量。
+
+完整配置可参考本机已验证的 $env:USERPROFILE\.sandbox.toml；不要把包含本机路径的用户配置文件提交到仓库。
+
+### 7.2 启动服务
+
+打开一个单独的 PowerShell 窗口执行：
+
+    $env:OPENSANDBOX_INSECURE_SERVER = "YES"
+    uvx --from opensandbox-server==0.2.2 opensandbox-server --config "$env:USERPROFILE\.sandbox.toml"
+
+这里的 OPENSANDBOX_INSECURE_SERVER=YES 仅适用于本机自托管、未配置 API Key 的开发服务。共享环境或生产环境必须配置 Sandbox Server API Key，并在客户端配置对应密钥，不要依赖 insecure 模式。
+
+确认服务监听：
+
+    Test-NetConnection 127.0.0.1 -Port 8080
+
+TcpTestSucceeded 必须为 True。
+
+## 8. 启动 DataHarness API
+
+在另一个 PowerShell 窗口执行：
+
+    uv run dataharness serve --config .\dataharness.local.toml --host 127.0.0.1 --port 8000
+
+V1 只允许回环地址；使用公网地址启动会被 CLI 拒绝。检查 API：
+
+    Invoke-RestMethod http://127.0.0.1:8000/healthz
+    Invoke-RestMethod http://127.0.0.1:8000/readyz
+
+预期返回：
+
+    {"status":"ok"}
+    {"status":"ready"}
+
+当前 API 进程启动时会自动创建/迁移 Runtime SQLite，但不会启动 OpenSandbox、Worker 或真实模型 Provider。
+
+## 9. API 最小操作流程
+
+### 9.1 创建 Project
+
+    $project = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/projects -ContentType application/json -Body '{"name":"demo-project"}'
+    $project
+    $projectId = $project.id
+
+### 9.2 导入文件
+
+API 接收原始 body，文件名通过 X-File-Name 传入：
+
+    @("id,name", "1,alpha", "2,beta") | Set-Content -Path .\demo.csv -Encoding utf8
+
+    curl.exe -X POST "http://127.0.0.1:8000/projects/$projectId/files" -H "X-File-Name: demo.csv" -H "Content-Type: application/octet-stream" --data-binary "@demo.csv"
+
+查询文件和版本：
+
+    Invoke-RestMethod "http://127.0.0.1:8000/projects/$projectId/files"
+
+同名文件再次上传会生成新的 ProjectFileVersion，不会修改旧版本。
+
+### 9.3 创建 Snapshot
+
+当前 API 没有 Snapshot 路由，因此使用同一 Runtime 数据目录通过 Python 调用 ProjectCorpus：
+
+    $snapshotId = uv run python -c "from pathlib import Path; from dataharness.api import ApiService; from dataharness.config import load_settings; from dataharness.domain import ProjectId; s=ApiService.from_settings(load_settings(Path('dataharness.local.toml'))); print(s.corpus.create_snapshot(ProjectId('$projectId')).id)"
+    $snapshotId
+
+Snapshot 创建后不可变。Run 必须显式绑定 Snapshot；文件后续更新不会改变旧 Run 的输入视图。
+
+### 9.4 创建 Task/Run
+
+    $taskBody = @{ project_snapshot_id = $snapshotId } | ConvertTo-Json
+    $task = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/projects/$projectId/tasks" -ContentType application/json -Body $taskBody
+    $task
+
+查询 Task、事件和最终回答：
+
+    $taskId = $task.task.id
+    Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId"
+    Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId/events"
+    Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId/answer"
+
+由于当前版本没有 Worker/Agent 的 CLI 装配，Task/Run 创建后不会自动完成分析；它们会等待实际的 LocalDurableExecutor/Agent handler 装配。
+
+取消、恢复和重试：
+
+    Invoke-RestMethod -Method Post "http://127.0.0.1:8000/tasks/$taskId/cancel"
+    Invoke-RestMethod -Method Post "http://127.0.0.1:8000/tasks/$taskId/resume"
+    Invoke-RestMethod -Method Post "http://127.0.0.1:8000/tasks/$taskId/retry"
+
+## 10. LLM 配置和真实模型现状
+
+配置样例中的声明是：
+
+    [model]
+    provider = "openai"
+    model = "gpt-4o-mini"
+    api_key_env = "DATAHARNESS_MODEL_API_KEY"
+    # base_url = "https://api.openai.com/v1"
+
+如果后续接入真实 Provider，Key 应这样注入，而不是写入 TOML、Runtime DB、Workspace 或日志：
+
+    $env:DATAHARNESS_MODEL_API_KEY = "<你的 API Key>"
+
+兼容 OpenAI API 的网关可以配置：
+
+    [model]
+    provider = "openai-compatible"
+    model = "你的模型名"
+    api_key_env = "DATAHARNESS_MODEL_API_KEY"
+    base_url = "https://你的网关/v1"
+
+但是，当前代码的 ModelProviderConfig 只保存这些声明，ApiService.from_settings 尚未把它们装配为真实 CloudModelProvider。真实请求入口仍是：
+
+    PydanticAI FunctionModel
+      -> ModelGateway
+      -> CloudModelProvider（当前需由部署代码注入）
+
+因此当前可复现测试使用 fake cloud；不要把配置样例中的模型名称误认为真实云调用已经接通。
+
+## 11. 完整验收流程
+
+### 11.1 不启动真实 Sandbox 的本地验证
+
+    uv lock --check
+    uv run python scripts/release_check.py
+    uv run python scripts/verify.py
+    uv run python scripts/phase10_baseline.py
+
+默认测试会明确跳过真实 OpenSandbox live 测试，不会把 fake Sandbox 冒充真实服务。
+
+### 11.2 启动真实 OpenSandbox 后的验收
+
+确认 OpenSandbox Server 已监听 8080、镜像 digest 证据存在后：
+
+    $env:DATAHARNESS_LIVE_SANDBOX = "1"
+    $env:OPEN_SANDBOX_ENDPOINT = "http://127.0.0.1:8080"
+
+    uv run pytest -q tests/integration/test_opensandbox_live.py
+    uv run pytest -q tests/e2e/test_phase10_v1.py
+
+真实测试覆盖：
+
+- create、attestation、terminate；
+- Python 和 SQL runner；
+- Step cancel、超时、输出限制；
+- 同 Project 并行 Sandbox 隔离；
+- 错误 digest fail-closed；
+- AnalysisRuntime 发布、hash、lineage；
+- durable Run 恢复和 Sandbox rebuild。
+
+### 11.3 发布前检查
+
+    uv run python scripts/release_check.py --require-image
+    git status --short
+
+确认工作树干净，并归档以下构建证据：
+
+    sandbox-images/secure-analysis/build-evidence/image-digest.txt
+    sandbox-images/secure-analysis/build-evidence/sbom.spdx.json
+    sandbox-images/secure-analysis/build-evidence/vuln-scan.json
+
+这些文件默认被 .gitignore 忽略，发布流水线必须将它们作为与镜像 digest 绑定的构建 Artifact 保存。
+
+## 12. 停止服务和数据备份
+
+停止 API：在 API 窗口按 Ctrl+C。
+
+停止 OpenSandbox：在 OpenSandbox 窗口按 Ctrl+C，确认没有残留 Sandbox：
+
+    docker ps
+
+不要直接删除 runtime-data。备份时至少保存：
+
+    runtime-data/runtime.db
+    runtime-data/privacy/
+    runtime-data/projects/
+
+恢复时保持 Runtime DB、Privacy DB 和 Workspace 根目录的相对关系不变，再重新执行配置检查、启动 OpenSandbox 和启动 API。不要手工编辑 Privacy 占位符映射或覆盖已发布文件。
+
+## 13. 故障排查
+
+### dataharness check 失败
+
+检查 TOML 格式、路径是否可写，以及 [sandbox].network_enabled 是否为 false。V1 禁止开启 Sandbox 网络。
+
+### API 能启动但 Task 不执行
+
+这是当前版本预期限制：serve 只启动控制面，没有 Worker/Agent 进程。检查 Task/Run 状态后，需要通过应用装配代码注入 LocalDurableExecutor、Agent handler、Sandbox Provider 和 ModelGateway。
+
+### OpenSandbox 创建失败
+
+按顺序检查：
+
+1. Test-NetConnection 127.0.0.1 -Port 8080；
+2. docker info；
+3. image-digest.txt 是否与本地 docker image inspect 的 digest 一致；
+4. .sandbox.toml 的 allowed_host_paths 是否包含 runtime-data；
+5. egress 是否为 dns+nft；
+6. execd 和 egress 镜像是否可拉取。
+
+### 模型调用失败
+
+当前版本没有真实模型 Provider 的生产装配，因此设置 API Key 后仍不会自动产生真实调用。请不要绕过 ModelGateway 直接在业务代码中调用 SDK；接入真实 Provider 时必须保留 secret block、PII placeholder、超时、预算和错误脱敏边界。
+
+### 如何判断服务是否健康
+
+    Invoke-RestMethod http://127.0.0.1:8000/healthz
+    Invoke-RestMethod http://127.0.0.1:8000/readyz
+    Test-NetConnection 127.0.0.1 -Port 8080
+
+API 健康不代表 Worker、OpenSandbox 或真实 LLM 已就绪；三者必须分别检查。
+
+## 14. 相关文档
+
+- [开发计划](doc/DEVELOPMENT_PLAN.md)
+- [架构说明](ARCHITECTURE.md)
+- [配置样例](dataharness.example.toml)
+- [V1 运维手册](doc/V1_OPERATIONS.md)
+- [Phase 10 发布报告](doc/phase-10-v1-release-20260814.md)
+- [secure-analysis 镜像说明](sandbox-images/secure-analysis/README.md)
