@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 存储层 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 06 · 状态与事实的守护者</div>
+  <h1>存储层：SQLite、迁移、事务与 CAS</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/storage/</code>：SQLite 连接策略、迁移系统、UnitOfWork、仓储层 CAS、事件日志。这是理解「崩溃恢复」的前提。</p>
+</header>
+<main>
+
+<h2>1. 为什么用 SQLite</h2>
+<p>本项目是<b>本地优先、单机单用户</b>（<span class="cite">ARCHITECTURE.md:9</span>）。SQLite 是本地状态事实源的最简选择：单文件、零运维、支持事务、内置全文检索（FTS5）。</p>
+<p>两个数据库各司其职（<span class="cite">ARCHITECTURE.md:335-341</span>）：</p>
+<table>
+<thead><tr><th>数据库</th><th>位置</th><th>内容</th><th>谁可见</th></tr></thead>
+<tbody>
+<tr><td><b>Runtime SQLite</b></td><td><code>runtime-data/runtime.db</code></td><td>Project/文件版本/Snapshot、Task/Run/Step 状态、事件、队列、lease</td><td>只有 Host；Agent 和沙箱<b>永远不可见</b></td></tr>
+<tr><td><b>Privacy SQLite</b></td><td><code>runtime-data/privacy/{task_id}.db</code></td><td>每 Task 的 PII 占位映射</td><td>只有 Host；与 Runtime 物理分离（第 09 课）</td></tr>
+</tbody>
+</table>
+
+<h2>2. 连接策略：每次连接都正确配置</h2>
+<p><code>storage/database.py</code> 定义了两个连接工厂。先看公共配置（<span class="cite">database.py:14-22</span>）：</p>
+<pre><code>row_factory = sqlite3.Row              # 行可按下标或列名访问
+PRAGMA foreign_keys = ON               # 外键约束生效（SQLite 默认关闭！）
+PRAGMA busy_timeout = 5000             # 写锁等待 5 秒而不是立刻报错
+PRAGMA journal_mode = WAL              # 预写日志：读写不互斥
+PRAGMA synchronous = FULL              # 每次提交等数据落盘（防断电丢数据）</code></pre>
+<p>关键点：<code>foreign_keys = ON</code> 必须每个连接手动开 —— 不配置的话 SQLite 会<b>静默忽略外键</b>。连接用 <code>isolation_level=None</code>（自动提交模式），事务完全由代码显式控制。</p>
+<p><code>RuntimeConnectionFactory.connect()</code> 在首次连接时自动执行迁移（<span class="cite">database.py:25-41</span>）。<code>PrivacyConnectionFactory</code>（<span class="cite">database.py:44-71</span>）有个有趣的安全细节：它校验 <code>task_id</code> 不含路径分隔符（<span class="cite">database.py:59-64</span>），防止路径穿越 —— ID 直接拼文件名。</p>
+
+<h2>3. 迁移系统：数据库的版本管理</h2>
+<p>迁移文件是带编号的 SQL，放在 <code>storage/migrations/</code>：</p>
+<pre><code>0001_runtime.sql           # 初始 schema + 不可变触发器
+0002_workspace_publications.sql   # 发布日志表
+0003_orchestration.sql     # 重试、checkpoint 恢复列
+0004_finding_coverage.sql  # findings 覆盖报告列
+0005_agent_harness.sql     # sessions.project_id、prompt 引用列</code></pre>
+<p>执行器在 <code>storage/migrate.py</code>：</p>
+<ul>
+<li>编号必须连续 1..N（<span class="cite">migrate.py:26-43</span>），跳号直接报错 —— 防止「我本地跑过 3 没跑 4」之类的漂移。</li>
+<li>每个迁移在独立事务里执行（<span class="cite">migrate.py:97-109</span>），失败整体回滚。</li>
+<li>已应用版本按<b>名字</b>核对，防止「同样编号不同内容」被当作已应用（<span class="cite">migrate.py:90-92</span>）。</li>
+</ul>
+<p>数据库层也是不可变性的第二道防线 —— 看 0001 里的触发器（<span class="cite">0001_runtime.sql:247-282</span>）：</p>
+<pre><code>-- Snapshot 及其成员是追加式事实；任何更新或删除都意味着既有 Run 的数据视图漂移。
+CREATE TRIGGER project_snapshots_no_update BEFORE UPDATE ON project_snapshots
+BEGIN SELECT RAISE(ABORT, 'project_snapshots 不可更新'); END;</code></pre>
+<p>领域层 frozen（第 05 课）管「代码里改不了」，SQLite 触发器管「数据库里改不了」——两层保险。</p>
+
+<h2>4. UnitOfWork：一个事务干完所有事</h2>
+<p><code>storage/uow.py</code> 是事务上下文管理器（<span class="cite">uow.py:19-34</span>）：</p>
+<pre><code>def __enter__(self) -> UnitOfWork:        # BEGIN（延迟）或 BEGIN IMMEDIATE
+    connection.execute("BEGIN IMMEDIATE" if self._immediate else "BEGIN")
+def __exit__(...):                        # 成功 commit，异常 rollback</code></pre>
+<p>典型用法 —— 仓储方法从不自己 commit，而是共享调用方的 UoW（<span class="cite">repository.py:4-5</span>）：</p>
+<pre><code>with self._store.unit_of_work() as uow:
+    stored = uow.repo.get_run(claimed.run.id)
+    updated = stored.value.succeed(now)
+    uow.repo.save_run(updated, stored.version, "RUN_SUCCEEDED", lease=..., lease_checked_at=now)</code></pre>
+<p>「状态变更 + 审计事件 + 相关记录」在<b>同一事务</b>里成功或一起回滚 —— 不会出现「状态改了但事件丢了」。</p>
+<p><code>immediate=True</code> 用于队列领取（第 11 课）：先拿写锁再读候选，两个 Worker 不会同时领到同一个 Run（<span class="cite">uow.py:13-17</span>）。</p>
+
+<h2>5. 仓储层：行 ↔ 对象 + CAS</h2>
+<p><code>RuntimeRepository</code>（<span class="cite">repository.py</span>，1225 行）是所有表访问的唯一入口。它的核心模式是 <b>CAS（Compare-And-Swap）</b>：每个表都有 <code>row_version</code> 列，每次更新都带版本条件：</p>
+<pre><code># repository.py:1206-1209
+def _require_cas(result) -> None:
+    if result.rowcount != 1:
+        raise ConcurrencyConflictError(...)</code></pre>
+<p>例如 <code>save_task</code>（<span class="cite">repository.py:596-625</span>）的更新条件：</p>
+<pre><code>UPDATE tasks SET status=?, ..., row_version = row_version + 1
+WHERE id = ? AND row_version = ? AND status = ?</code></pre>
+<p>如果两个请求同时改同一个 Task，第二个的 <code>row_version</code> 已经不匹配，更新 0 行 → 抛 <code>ConcurrencyConflictError</code>。<b>乐观并发控制</b>：不加锁也能防止丢失更新。</p>
+<p>仓储还复验状态机（<span class="cite">repository.py:112-117</span>）：即使调用方绕过领域层直接拼对象，<code>_check_transition</code> 也会在写库前拒绝非法转移 —— 领域校验的<b>兜底副本</b>。</p>
+
+<h2>6. 事件日志：追加式的审计事实</h2>
+<p>每次状态变更都伴随一个事件（同一事务）。<code>append_event</code>（<span class="cite">repository.py:126-155</span>）有两个安全特性：</p>
+<pre><code># 拒绝把敏感内容写进事件
+_FORBIDDEN_EVENT_KEY_PARTS = ("secret", "password", "token", "api_key", "pii", "prompt", "response", "payload")
+_MAX_EVENT_PAYLOAD_BYTES = 16 * 1024</code></pre>
+<p>键名里含 <code>secret/prompt/pii...</code> 的元数据直接拒绝；payload 超 16 KiB 拒绝。所以事件流<b>天然是脱敏的</b>——第 13 课的 SSE 前端看到的就是这些事件。</p>
+<p>事件的持久化消费方式：API 端 <code>task_events</code> 把 Task 及其所有 Run/Step/Finding 的事件按 ID 合并排序（<span class="cite">api/services.py:343-355</span>），SSE 用事件 ID 做游标断点续传（<span class="cite">api/app.py:268-302</span>）。</p>
+
+<h2>7. 队列原语：SQLite 当消息队列用</h2>
+<p><code>SqliteRuntimeStore</code> 提供 5 个「原子队列操作」（<span class="cite">store.py:17-22</span>），每个都是完整事务：</p>
+<table>
+<thead><tr><th>方法</th><th>行为</th><th>行号</th></tr></thead>
+<tbody>
+<tr><td><code>claim_next_run</code></td><td>原子领取最早 QUEUED Run 或回收过期 RUNNING lease</td><td><span class="cite">store.py:34-100</span></td></tr>
+<tr><td><code>heartbeat</code></td><td>续租（校验 owner/epoch/未过期）</td><td><span class="cite">store.py:102-126</span></td></tr>
+<tr><td><code>request_cancel</code></td><td>三种状态的取消语义（QUEUED 直接取消/WAITING 先恢复再取消/RUNNING 只记意图）</td><td><span class="cite">store.py:128-151</span></td></tr>
+<tr><td><code>resume_waiting</code></td><td>恢复 WAITING 的 Run 并设置再试时间</td><td><span class="cite">store.py:153-163</span></td></tr>
+<tr><td><code>schedule_retry</code></td><td>释放 lease + 记录重试次数 + 设置 next_attempt_at，同一事务</td><td><span class="cite">store.py:165-206</span></td></tr>
+</tbody>
+</table>
+<p>为什么要封装成「完整事务原语」而不是公开方法？看注释（<span class="cite">store.py:17-22</span>）：<b>调用方无法在「选候选」和「写 lease」之间插入不原子逻辑</b> —— 排队语义被锁死在正确的地方。</p>
+
+<h2>8. 练习</h2>
+<div class="practice">
+<strong>练习：亲手看数据</strong>
+<ol>
+<li>打开 <code>storage/migrations/0001_runtime.sql</code>，找到 <code>runs</code> 表的 lease 三列 CHECK 约束（<span class="cite">0001_runtime.sql:119-120</span>），用自己的话说出它约束什么。</li>
+<li>打开 <code>storage/repository.py</code> 的 <code>save_run</code>（674 行附近），数出 UPDATE 语句里有多少个 AND 条件，逐一说出每个条件防什么。</li>
+<li>运行 <code>uv run python -c "from dataharness.storage import RuntimeConnectionFactory; from pathlib import Path; f=RuntimeConnectionFactory(Path('runtime-data/runtime.db')); c=f.connect(); print(c.execute('select version, name from schema_migrations').fetchall())"</code>，看看你的库里已经应用了几个迁移。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：WAL 模式的直接好处是？</h4>
+<div class="options">
+  <button class="option" data-correct="false">让 SQLite 支持网络访问</button>
+  <button class="option" data-correct="true">读写可以并发（读不阻塞写、写不阻塞读）</button>
+  <button class="option" data-correct="false">让数据库文件变小</button>
+  <button class="option" data-correct="false">自动开启外键</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+WAL（Write-Ahead Logging）让写操作先追加到 wal 文件，读操作继续读旧快照 —— 读写互不阻塞（<span class="cite">database.py:14-22</span>）。API 读、Worker 写同一 SQLite 时，这非常关键。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：两个 Worker 同时 claim 同一个 Run 会发生什么？</h4>
+<div class="options">
+  <button class="option" data-correct="false">两个都成功，重复执行</button>
+  <button class="option" data-correct="false">直接崩溃</button>
+  <button class="option" data-correct="true">BEGIN IMMEDIATE + CAS 保证只有一个成功，另一个报 LeaseLostError 或领到别的 Run</button>
+  <button class="option" data-correct="false">SQLite 随机让一个静默失败</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>claim_next_run</code>（<span class="cite">store.py:34-100</span>）用 <code>BEGIN IMMEDIATE</code> 串行化，<code>WHERE row_version = ?</code> 保证只有第一个提交者成功（CAS）。失败者抛 <code>LeaseLostError</code>，Worker 循环继续领下一个。第 11 课详讲 lease 语义。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="https://www.sqlite.org/wal.html">SQLite WAL 官方文档</a>（理解并发模式），
+和 <a href="https://www.sqlite.org/lang_transaction.html">事务与锁</a>（理解 BEGIN IMMEDIATE 与死锁）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「为什么事件键名含 payload 就拒绝？」「CAS 和悲观锁哪个更适合这里？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="05-domain-models.html">上一课：领域模型与状态机</a>
+  <a class="next" href="07-project-corpus.html">下一课：文件导入与检索</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 06 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

@@ -173,7 +173,7 @@ None。与原报告一致，不新增 Runtime migration；真实环境证据全�
 
 ## 11. Next-phase entry check
 
-Phase 06 的前置条件已满足：真实 Sandbox 服务可用（127.0.0.1:8080）、secure-analysis 镜像
+Phase 06 的前置条件已满足：真实 Sandbox 服务可用（127.0.0.1:18080）、secure-analysis 镜像
 已锁定 digest、SDK 包装与 attestation 已验收、create/connect/execute/cancel/terminate
 集成测试 6/6 通过。Phase 06 报告见
 [phase-06-analysis-20260814.md](phase-06-analysis-20260814.md)。

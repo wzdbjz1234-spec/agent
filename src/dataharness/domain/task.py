@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .clock import utcnow
 from .enums import TaskStatus, WaitReason
 from .errors import IllegalStateTransitionError
-from .ids import ProjectId, SessionId, TaskId
+from .ids import ContentHash, ProjectId, SessionId, TaskId
 from .state_machine import check_transition
 
 # Task 迁移表：终态（COMPLETED/FAILED/CANCELLED）无出边，不可回退
@@ -34,6 +34,9 @@ class Task(BaseModel):
     id: TaskId
     project_id: ProjectId
     session_id: SessionId | None = None
+    # 原始用户问题只保存在受控 Workspace；Runtime 仅保存下面两个稳定引用。
+    prompt_ref: str | None = None
+    prompt_hash: ContentHash | None = None
     status: TaskStatus = TaskStatus.QUEUED
     wait_reason: WaitReason | None = None
     created_at: datetime = Field(default_factory=utcnow)
@@ -47,6 +50,8 @@ class Task(BaseModel):
             raise ValueError("WAITING 状态必须提供 wait_reason")
         if self.status != TaskStatus.WAITING and self.wait_reason is not None:
             raise ValueError("非 WAITING 状态不得携带 wait_reason")
+        if (self.prompt_ref is None) != (self.prompt_hash is None):
+            raise ValueError("prompt_ref 与 prompt_hash 必须同时存在或同时为空")
         return self
 
     def _require_from(self, allowed: frozenset[TaskStatus], action: str) -> None:

@@ -1,7 +1,7 @@
 """真实 OpenSandbox 服务 + secure-analysis 镜像的集成测试（需 Docker + 本地服务）。
 
 运行条件：
-- OpenSandbox 服务运行在 127.0.0.1:8080（docker runtime）
+- OpenSandbox 服务运行在 127.0.0.1:18080（docker runtime）
 - secure-analysis 镜像已按 build.ps1 构建并锁定 digest（build-evidence/image-digest.txt）
 - 设置环境变量 ``DATAHARNESS_LIVE_SANDBOX=1`` 才执行；否则显式跳过（不掩盖失败）。
 """
@@ -69,7 +69,7 @@ REQUIRES_LIVE = pytest.mark.skipif(
     reason="设置 DATAHARNESS_LIVE_SANDBOX=1 并启动 OpenSandbox 服务后运行真实集成测试",
 )
 
-ENDPOINT = os.environ.get("OPEN_SANDBOX_ENDPOINT", "http://127.0.0.1:8080")
+ENDPOINT = os.environ.get("OPEN_SANDBOX_ENDPOINT", "http://127.0.0.1:18080")
 _MOUNT_ROOT = Path("runtime-data") / "live-sandbox"
 
 

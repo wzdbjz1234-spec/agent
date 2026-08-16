@@ -6,6 +6,9 @@ FastAPI 路由只做参数校验、调用本服务和序列化。SQLite、Worksp
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,6 +16,7 @@ from typing import Any
 from dataharness.analysis import ProjectFileView, VerificationService
 from dataharness.config import Settings
 from dataharness.domain import (
+    ArtifactId,
     FileId,
     FileVersionId,
     FindingId,
@@ -23,7 +27,7 @@ from dataharness.domain import (
     TaskId,
     TaskStatus,
 )
-from dataharness.orchestration import RunService, TaskService
+from dataharness.orchestration import RunService, SessionService, TaskService
 from dataharness.projects import ProjectCorpus
 from dataharness.providers.observability import OpenTelemetryAdapter
 from dataharness.providers.workspace import LocalWorkspace, normalize_filename
@@ -49,25 +53,47 @@ class ApiService:
         tasks: TaskService,
         runs: RunService,
         *,
+        sessions: SessionService | None = None,
         bridge: WorkspaceBridge | None = None,
         verification: VerificationService | None = None,
         observability: OpenTelemetryAdapter | None = None,
         workspace: LocalWorkspace | None = None,
+        diagnostics: dict[str, object] | None = None,
+        worker_health_file: Path | None = None,
     ) -> None:
         self.store = store
         self.corpus = corpus
         self.tasks = tasks
         self.runs = runs
+        self.sessions = sessions or SessionService(store)
         self.bridge = bridge
         self.verification = verification
         self.observability = observability or OpenTelemetryAdapter()
         # 仅供 import_bytes 的临时源文件使用，不把路径暴露到 API DTO。
         self._workspace = workspace
+        # API 只读取 Worker 的安全心跳投影，不读取 Worker 日志、prompt 或 Runtime
+        # 私密内容。文件不存在时保留 ``not_reported``，避免把“没有监督证据”伪装成健康。
+        self._worker_health_file = worker_health_file
+        # 诊断抽屉只需要运行状态摘要；这里不保存或返回 API Key、SQLite 内容和
+        # Workspace 原始文件清单。Fake Service 未提供时使用明确的未知状态。
+        self._diagnostics = diagnostics or {
+            "api": "ready",
+            "worker": "not_reported",
+            "model": {"configured": False},
+            "sandbox": {"configured": False},
+        }
 
     @property
     def workspace(self) -> LocalWorkspace | None:
         """返回内部 Workspace 适配器，供本地 worker/E2E 装配复用。"""
         return self._workspace
+
+    @property
+    def max_import_bytes(self) -> int:
+        """返回已装配 Workspace 的导入上限，供 HTTP 在读取 body 前执行限制。"""
+        if self._workspace is None:
+            raise ApiError(500, "SERVICE_NOT_CONFIGURED", "文件导入服务未完成装配")
+        return self._workspace.max_file_bytes
 
     @classmethod
     def from_settings(cls, settings: Settings) -> ApiService:
@@ -87,14 +113,39 @@ class ApiService:
         bridge = WorkspaceBridge(workspace, journal)
         tasks = TaskService(store, workspace=workspace)
         runs = RunService(store, workspace=workspace)
+        sessions = SessionService(store)
         return cls(
             store,
             corpus,
             tasks,
             runs,
+            sessions=sessions,
             bridge=bridge,
             verification=VerificationService(store, corpus, workspace, bridge),
             workspace=workspace,
+            diagnostics={
+                "api": "ready",
+                "worker": "not_reported",
+                "model": {
+                    "provider": settings.model.provider,
+                    "model": settings.model.model,
+                    # 只显示配置状态，绝不返回 TOML 中的秘密值。
+                    "configured": bool(settings.model.api_key),
+                },
+                "sandbox": {
+                    "endpoint": settings.sandbox.endpoint,
+                    "runtime": settings.sandbox.runtime,
+                    "image_digest": settings.sandbox.image_digest or "未锁定",
+                    "configured": bool(settings.sandbox.image_digest),
+                },
+                "paths": {
+                    "runtime_data_root": str(settings.paths.runtime_data_root),
+                    "disk_free_bytes": shutil.disk_usage(settings.paths.runtime_data_root).free,
+                },
+            },
+            worker_health_file=(
+                Path(value) if (value := os.getenv("DATAHARNESS_WORKER_HEALTH_FILE")) else None
+            ),
         )
 
     def list_projects(self) -> tuple[Any, ...]:
@@ -108,6 +159,48 @@ class ApiService:
     def create_project(self, name: str):
         return self.corpus.create_project(name)
 
+    def archive_project(self, project_id: str):
+        """归档项目但保留历史文件、Snapshot 和任务事实，供 WebUI 显式确认后调用。"""
+        return self.corpus.archive_project(ProjectId(project_id))
+
+    def list_tasks(self, project_id: str, session_id: str | None = None):
+        """返回项目任务的安全生命周期视图，不读取 Workspace 中的原始问题正文。"""
+        project = ProjectId(project_id)
+        selected_session = SessionId(session_id) if session_id else None
+        with self.store.unit_of_work() as uow:
+            tasks = uow.repo.list_tasks_for_project(project)
+        if selected_session is not None:
+            tasks = tuple(item for item in tasks if item.session_id == selected_session)
+        return tasks
+
+    def diagnostics(self) -> dict[str, object]:
+        """返回可在本地诊断抽屉展示的脱敏配置摘要。"""
+        result = dict(self._diagnostics)
+        worker = result.get("worker", "not_reported")
+        if self._worker_health_file is not None:
+            try:
+                raw = self._worker_health_file.read_bytes()[:8192]
+                payload = json.loads(raw.decode("utf-8"))
+                if isinstance(payload, dict) and payload.get("status") in {
+                    "STARTING",
+                    "IDLE",
+                    "RUNNING",
+                    "STOPPING",
+                    "STOPPED",
+                    "FAILED",
+                }:
+                    # UI 只需要状态文本；PID/时间戳在 status.ps1 中展示，避免 API
+                    # 诊断接口逐渐演化成进程控制面。
+                    worker = str(payload["status"])
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                worker = "heartbeat_unavailable"
+        result["worker"] = worker
+        return result
+
+    def create_snapshot(self, project_id: str):
+        """为用户提交问题显式固定当前 Project 视图。"""
+        return self.corpus.create_snapshot(ProjectId(project_id))
+
     def import_file_bytes(self, project_id: str, name: str, data: bytes):
         """把一次 HTTP body 转成短生命周期的普通文件，再交给 ProjectCorpus。
 
@@ -118,6 +211,8 @@ class ApiService:
             raise ApiError(500, "SERVICE_NOT_CONFIGURED", "文件导入服务未完成装配")
         if not data:
             raise ApiError(400, "EMPTY_FILE", "文件内容不能为空")
+        if len(data) > self.max_import_bytes:
+            raise ApiError(413, "FILE_TOO_LARGE", "文件超过允许的大小上限")
         try:
             safe_name = normalize_filename(name)
         except (ValueError, UnsafePathError) as error:
@@ -131,6 +226,16 @@ class ApiService:
                 )
         except (OSError, ResourceIntegrityError, UnsafePathError) as error:
             raise ApiError(400, "FILE_IMPORT_FAILED", "文件暂存失败") from error
+
+    def import_file_path(self, project_id: str, name: str, source: Path):
+        """导入已由 HTTP 层有界落盘的临时文件，避免再把完整请求复制到内存。"""
+        if self._workspace is None:
+            raise ApiError(500, "SERVICE_NOT_CONFIGURED", "文件导入服务未完成装配")
+        try:
+            safe_name = normalize_filename(name)
+            return self.corpus.import_file(ProjectId(project_id), source, logical_name=safe_name)
+        except (OSError, ResourceIntegrityError, UnsafePathError) as error:
+            raise ApiError(400, "FILE_IMPORT_FAILED", "文件导入失败，请检查格式和大小") from error
 
     def list_files(self, project_id: str) -> tuple[ProjectFileView, ...]:
         project = ProjectId(project_id)
@@ -187,9 +292,19 @@ class ApiService:
         resource = self.corpus.open_resource(SnapshotId(snapshot_id), FileVersionId(version_id))
         return resource.data, resource.media_type
 
-    def create_task(self, project_id: str, snapshot_id: str, session_id: str | None):
+    def create_session(self, project_id: str, label: str | None = None):
+        return self.sessions.create(ProjectId(project_id), label)
+
+    def list_sessions(self, project_id: str):
+        return self.sessions.list_for_project(ProjectId(project_id))
+
+    def create_task(
+        self, project_id: str, snapshot_id: str, session_id: str | None, prompt: str | None = None
+    ):
         task = self.tasks.create(
-            ProjectId(project_id), SessionId(session_id) if session_id else None
+            ProjectId(project_id),
+            SessionId(session_id) if session_id else None,
+            prompt=prompt,
         )
         try:
             run = self.runs.create(task.id, SnapshotId(snapshot_id))
@@ -237,20 +352,51 @@ class ApiService:
             if active_run is None:
                 raise ApiError(409, "RUN_NOT_RESUMABLE", "Task 没有可恢复的 Run")
             return resumed, active_run
+        if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
+            # Task 终态不可回退。用户重试改为从受控 PROMPT.json 复制同一目标，创建新的
+            # Task/Run；既保留历史事实，也满足终态执行必须生成新 Run 的重试语义。
+            if self._workspace is None or task.prompt_ref is None:
+                raise ApiError(409, "RETRY_PROMPT_UNAVAILABLE", "原始问题不可读取，无法重试")
+            try:
+                payload = json.loads(
+                    self._workspace.read_task_state(task.project_id, task.id, "PROMPT.json")
+                )
+                prompt = payload.get("prompt") if isinstance(payload, dict) else None
+            except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as error:
+                raise ApiError(
+                    409, "RETRY_PROMPT_UNAVAILABLE", "原始问题不可读取，无法重试"
+                ) from error
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ApiError(409, "RETRY_PROMPT_UNAVAILABLE", "原始问题不可读取，无法重试")
+            selected = snapshot_id or (str(runs[-1].project_snapshot_id) if runs else None)
+            if selected is None:
+                raise ApiError(400, "SNAPSHOT_REQUIRED", "重试必须指定 ProjectSnapshot")
+            return self.create_task(
+                str(task.project_id),
+                selected,
+                str(task.session_id) if task.session_id else None,
+                prompt,
+            )
         if task.status != TaskStatus.ACTIVE:
-            raise ApiError(409, "TASK_TERMINAL", "终态 Task 不可重开；请创建新的 Task")
+            raise ApiError(409, "TASK_NOT_RETRYABLE", "当前 Task 状态不可重试")
         selected = snapshot_id or (str(runs[-1].project_snapshot_id) if runs else None)
         if selected is None:
             raise ApiError(400, "SNAPSHOT_REQUIRED", "重试必须指定 ProjectSnapshot")
         return task, self.runs.create(task.id, SnapshotId(selected))
 
-    def task_events(self, task_id: str) -> tuple[EventRecord, ...]:
+    def task_events(self, task_id: str, *, after_id: int = 0) -> tuple[EventRecord, ...]:
         task_id_value = TaskId(task_id)
         with self.store.unit_of_work() as uow:
             events = list(uow.repo.list_events("task", str(task_id_value)))
             for run in uow.repo.list_runs_for_task(task_id_value):
                 events.extend(uow.repo.list_events("run", str(run.id)))
-            return tuple(sorted(events, key=lambda item: (item.occurred_at, item.id)))
+                for step in uow.repo.list_steps_for_run(run.id):
+                    events.extend(uow.repo.list_events("step", str(step.id)))
+                for finding in uow.repo.list_findings_for_run(run.id):
+                    events.extend(uow.repo.list_events("finding", str(finding.id)))
+            return tuple(
+                sorted((event for event in events if event.id > after_id), key=lambda item: item.id)
+            )
 
     def task_findings(self, task_id: str):
         """返回当前 Task 的 Finding，包括 DRAFT，供客户端显示验证状态。"""
@@ -305,9 +451,20 @@ class ApiService:
                         disclosures["FULL_PROJECT 覆盖报告存在未覆盖文件"] = True
                     if event.event_type == "FINDING_DATA_WARNINGS":
                         disclosures["Finding 包含数据质量告警"] = True
+            answer = None
+            if self._workspace is not None:
+                try:
+                    payload = json.loads(
+                        self._workspace.read_task_state(task.project_id, task.id, "ANSWER.json")
+                    )
+                    if isinstance(payload, dict) and isinstance(payload.get("answer"), str):
+                        answer = payload["answer"]
+                except (FileNotFoundError, OSError, ValueError):
+                    answer = None
         return TaskAnswer(
             task_id=str(task.id),
             task_status=str(task.status),
+            answer=answer,
             run_ids=tuple(str(run.id) for run in runs),
             findings=findings,
             datasets=datasets,
@@ -340,6 +497,36 @@ class ApiService:
             if kind == "datasets":
                 return uow.repo.list_project_datasets(project)
             return uow.repo.list_project_artifacts(project)
+
+    def artifact_content(self, project_id: str, artifact_id: str) -> tuple[bytes, str]:
+        """只读取指定 Project 下 AVAILABLE 的正式产物，不接受 Workspace 路径。"""
+        if self._workspace is None or self.bridge is None:
+            raise ApiError(500, "SERVICE_NOT_CONFIGURED", "产物读取服务未完成装配")
+        project = ProjectId(project_id)
+        with self.store.unit_of_work() as uow:
+            artifact = uow.repo.get_artifact(ArtifactId(artifact_id))
+            if artifact.project_id != project:
+                raise ApiError(404, "ARTIFACT_NOT_FOUND", "项目中不存在该产物")
+        record = next(
+            (
+                item
+                for item in self.bridge.available(project)
+                if item.resource_id == artifact_id and item.kind.value == "ARTIFACT"
+            ),
+            None,
+        )
+        if record is None:
+            raise ApiError(404, "ARTIFACT_NOT_AVAILABLE", "产物尚未发布")
+        media_type = (
+            "image/svg+xml"
+            if record.output_name.casefold().endswith(".svg")
+            else (
+                "image/png"
+                if record.output_name.casefold().endswith(".png")
+                else "application/json"
+            )
+        )
+        return self._workspace.read_published_resource(record), media_type
 
 
 def build_default_service(settings: Settings | None = None) -> ApiService:

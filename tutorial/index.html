@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>课程首页 · 从零读懂 DataHarness</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">DataHarness 源码教程 · 面向零基础</div>
+  <h1>从零读懂 DataHarness：一个 Python Web + Agent 项目的完整解剖</h1>
+  <p class="subtitle">用 13 节课，从一个不懂 FastAPI 的初学者，变成能自己读代码、改代码、跑通全流程的人。</p>
+</header>
+<main>
+
+<h2>这个课程是什么</h2>
+<p>
+DataHarness（<code>C:\projects\research</code>）是一个真实、完整的项目：一个「云端 LLM 驱动、本地持久化、沙箱隔离执行」的数据分析 Agent Harness。
+它覆盖了 Python Web 开发（FastAPI）、SQLite 存储、LLM Agent、安全边界等几乎全部后端进阶主题，而且是<b>按生产安全标准写的</b>。
+本课程带你<b>结合真实代码</b>一步步读懂它：每个概念都指向仓库里的具体文件和行号，你随时可以打开代码对照。
+</p>
+
+<div class="callout">
+<strong>它到底能干什么？</strong>
+<p>把数据文件（CSV/Excel/PDF/Word…）导入本地项目 → 由云端大模型理解你的问题 → 模型自动生成 Python/SQL 代码 → 代码在一个<b>断网、只读</b>的沙箱容器里执行 → 结果、图表、结论作为正式产物发布，并附带可验证的证据链。整个过程所有状态都持久化在本地 SQLite 里，任务中断、崩溃都能恢复。</p>
+</div>
+
+<h2>学习路径</h2>
+<p>建议按编号顺序学习。每课约 10–20 分钟，读完立刻到仓库里对照代码，然后做课末练习。<b>不要跳课</b>——后面的课都依赖前面的概念。</p>
+
+<ul class="toc">
+  <li><span class="n">01</span> <a href="01-project-overview.html">项目概览：这个仓库是什么</a>
+      <span class="d">功能全景、技术栈、目录结构、如何运行。先建立整体地图。</span></li>
+  <li><span class="n">02</span> <a href="02-python-web-basics.html">Python 与 Web 基础：读懂代码需要的最小知识</a>
+      <span class="d">类型标注、Pydantic BaseModel、async/await、HTTP 与 Web 服务器是什么。</span></li>
+  <li><span class="n">03</span> <a href="03-fastapi-api-layer.html">FastAPI 入门：逐行读懂 API 层</a>
+      <span class="d">路由、中间件、异常映射、请求/响应模型 —— 全部对照 api/app.py 真实代码。</span></li>
+  <li><span class="n">04</span> <a href="04-config-system.html">配置系统：从 TOML 到 Pydantic Settings</a>
+      <span class="d">config.py 全解：嵌套模型、派生路径、校验、密钥保护。</span></li>
+  <li><span class="n">05</span> <a href="05-domain-models.html">领域模型与状态机：不可变对象如何管状态</a>
+      <span class="d">frozen 模型、NewType ID、状态转移表、不变量校验。</span></li>
+  <li><span class="n">06</span> <a href="06-storage-sqlite.html">存储层：SQLite、迁移、事务与 CAS</a>
+      <span class="d">迁移系统、UnitOfWork、仓储层、事件日志、并发控制。</span></li>
+  <li><span class="n">07</span> <a href="07-project-corpus.html">文件导入、全文检索与快照</a>
+      <span class="d">ProjectCorpus：导入管线、格式识别、FTS5/BM25、不可变 Snapshot。</span></li>
+  <li><span class="n">08</span> <a href="08-agent-basics.html">Agent 基础：LLM 如何调用工具</a>
+      <span class="d">Agent 是什么、PydanticAI 如何工作、本项目装配的唯一 Agent 与 10 个窄工具。</span></li>
+  <li><span class="n">09</span> <a href="09-model-gateway-privacy.html">模型出口与隐私边界：ModelGateway</a>
+      <span class="d">凭据阻断、PII 占位符、Privacy SQLite、恢复语义 —— 全项目最值得读的部分。</span></li>
+  <li><span class="n">10</span> <a href="10-sandbox-execution.html">沙箱：LLM 生成的代码在哪里执行</a>
+      <span class="d">OpenSandbox、digest 锁定、attestation 探测、三步挂载、资源限制。</span></li>
+  <li><span class="n">11</span> <a href="11-durable-execution.html">耐久编排：Worker、租约、重试与崩溃恢复</a>
+      <span class="d">LocalDurableExecutor 全解：原子领取、lease fencing、取消语义、恢复决策。</span></li>
+  <li><span class="n">12</span> <a href="12-verification-lineage.html">验证门与血缘：让结论可信</a>
+      <span class="d">ExecutionGate / IntegrityGate / EvidenceGate、Finding 生命周期、Lineage 记录。</span></li>
+  <li><span class="n">13</span> <a href="13-end-to-end.html">端到端实操：跑通一次完整分析</a>
+      <span class="d">启动服务、建项目、导文件、建 Task、看 SSE 事件、读最终答案 —— 把前 12 课串起来。</span></li>
+</ul>
+
+<h2>配套参考</h2>
+<ul>
+  <li><a href="glossary.html">术语表</a> —— 所有课程统一使用，遇到不认识的词先查这里。</li>
+  <li><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> —— 项目官方架构文档（本课程的事实基准）。</li>
+  <li><a href="../README.md">README.md</a> —— 官方运行手册。</li>
+</ul>
+
+<div class="ask">
+<strong>学完有问题怎么办？</strong>
+<p>每课的末尾都有一句提醒：<b>把问题直接问你的 AI 老师</b>（也就是正在和你对话的 agent）。任何概念不清楚、代码看不懂、练习做不出来，都可以让它结合代码给你讲透。</p>
+</div>
+
+<footer class="site">
+  <span>DataHarness 源码教程</span>
+  <span><a href="glossary.html">术语表</a></span>
+</footer>
+</main>
+</body>
+</html>

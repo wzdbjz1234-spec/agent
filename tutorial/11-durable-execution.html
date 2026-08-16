@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 耐久编排 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 11 · 崩溃恢复与并发安全</div>
+  <h1>耐久编排：Worker、租约、重试与崩溃恢复</h1>
+  <p class="subtitle">本课解剖 <code>providers/durable/executor.py</code> 与 <code>storage/store.py</code> 的队列原语：任务如何被领取、如何保证只有一个 Worker 在跑、崩溃后如何恢复。这是「长时运行 Agent」项目的精髓。</p>
+</header>
+<main>
+
+<h2>1. 问题：Agent 任务需要"耐久"</h2>
+<p>一个分析 Run 可能跑几十分钟。期间可能发生：API 重启、Worker 崩溃、沙箱被销毁、机器断电。用户的期望（<span class="cite">ARCHITECTURE.md:483-484</span>）：</p>
+<ul>
+<li>任务不丢：状态都在 SQLite 里，随时可恢复；</li>
+<li>不重复执行：恢复后从最后 checkpoint 继续，而不是重跑全部；</li>
+<li>同一时间只有一个 Worker 在跑同一个 Run（否则会重复执行代码、重复发布产物）。</li>
+</ul>
+<p>实现方案：<b>SQLite 即队列 + 租约（lease）+ fencing token</b>，不用 Prefect 之类的重型编排（<span class="cite">ARCHITECTURE.md:474</span>）。</p>
+
+<h2>2. 领取：原子操作</h2>
+<p>Worker 的循环（<span class="cite">executor.py:110-120</span>）：</p>
+<pre><code>async def run_worker(self, stop_event: asyncio.Event, *, idle_sleep_seconds: float = 0.1) -> None:
+    """可停止的 worker loop；等待期间不持有任何 Run lease。"""
+    while not stop_event.is_set():
+        result = await self.run_once()     # 领取并执行一个 Run
+        if result is None:
+            await asyncio.wait_for(stop_event.wait(), idle_sleep_seconds)   # 空闲就睡 0.1s</code></pre>
+<p>领取本身是 SQLite 原子事务 <code>claim_next_run</code>（<span class="cite">store.py:34-100</span>），选择条件值得逐行读：</p>
+<pre><code>SELECT * FROM runs WHERE
+  (status = 'QUEUED' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))      -- ① 排队的
+  OR (status = 'RUNNING' AND
+      ((lease_owner IS NOT NULL AND lease_expires_at <= ?)                       -- ② 租约过期的
+       OR (lease_owner IS NULL AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?)))  -- ③ 重试到期的
+ORDER BY CASE WHEN status = 'QUEUED' THEN 0 ELSE 1 END, created_at, id LIMIT 1</code></pre>
+<p>① 优先领最早排队的；②<b>回收租约已过期的 RUNNING Run</b> —— 这正是一个「跑死了但没交代的 Run」，它的 lease 过期等于宣告死亡；③ 领重试时间已到的。整个领取 + 写 lease + 发事件在一个 <code>BEGIN IMMEDIATE</code> 事务里（第 06 课），并发安全。</p>
+
+<h2>3. 租约与 fencing：谁在跑，由令牌说了算</h2>
+<p>领取时执行器写：<code>lease_owner</code>、<code>lease_epoch = lease_epoch + 1</code>、<code>lease_expires_at</code>、<code>heartbeat_at</code>（<span class="cite">store.py:63-71</span>）。</p>
+<p>之后<b>每一次状态提交</b>（<code>save_run</code>，<span class="cite">repository.py:705-723</span>）都带租约条件：</p>
+<pre><code>where += " AND lease_owner = ? AND lease_epoch = ? AND lease_expires_at > ?"</code></pre>
+<p>只有「当前 owner + 当前 epoch + 未过期」才能提交。这就是 <b>fencing token 模式</b>：</p>
+<div class="callout">
+<strong>为什么 epoch 是关键</strong>
+<p>假设 Worker A 领取 Run（epoch=1）后网络卡了 40 秒（lease 30 秒过期）。Worker B 回收了它（epoch=2）开始执行。
+这时 A 醒了想提交结果 —— 它的 epoch=1 已经与库里的 2 不匹配，提交被拒（<code>LeaseLostError</code>）。
+<b>只有当前持有者能说话</b>，过期者永远闭嘴。这防止了「僵尸 Worker 覆盖活 Worker」的最坏并发事故。</p>
+</div>
+<p>注意 <code>expires_at</code> 的判断用的是<b>数据库里存的过期时间</b>而不是调用方传的时间（<span class="cite">repository.py:710-711</span> 的注释）—— 即使 lease「已过期但还没被回收」，旧 Worker 也提交不了。lease 到期本身就构成边界。</p>
+
+<h2>4. 执行与恢复决策</h2>
+<p>执行入口 <code>_execute_claim</code>（<span class="cite">executor.py:122-170</span>）。先看恢复决策（<span class="cite">executor.py:176-192</span>）：</p>
+<pre><code>@staticmethod
+def _recovery_decision(run, recovered, checkpoint) -> RecoveryDecision:
+    if run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED):
+        return RecoveryDecision.TERMINAL          # 终态：什么都不做
+    if not recovered:
+        return RecoveryDecision.START_FROM_BEGINNING   # 新 Run：从头开始
+    if checkpoint is None:
+        return RecoveryDecision.START_FROM_BEGINNING   # 恢复但无 checkpoint：从头
+    if checkpoint.project_snapshot_id != run.project_snapshot_id:
+        raise PolicyDeniedError(...)                   # checkpoint 与快照不符：拒绝
+    return (RecoveryDecision.RESUME_FROM_CHECKPOINT if checkpoint.sandbox_id
+            else RecoveryDecision.REBUILD_SANDBOX)     # 有沙箱可重连就续跑，否则重建沙箱续跑</code></pre>
+<p>四个决策的含义：</p>
+<table>
+<thead><tr><th>决策</th><th>场景</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td>TERMINAL</td><td>Run 已是终态</td><td>不执行</td></tr>
+<tr><td>START_FROM_BEGINNING</td><td>新 Run 或没有任何 checkpoint</td><td>从头跑</td></tr>
+<tr><td>RESUME_FROM_CHECKPOINT</td><td>有 checkpoint 且沙箱还在</td><td>重连沙箱 + 恢复消息历史，继续</td></tr>
+<tr><td>REBUILD_SANDBOX</td><td>有 checkpoint 但沙箱没了</td><td>重建沙箱（同 digest）+ 恢复，继续</td></tr>
+</tbody>
+</table>
+<p>恢复前还有两道防线：checkpoint 的镜像 digest 必须与当前 spec 一致（<span class="cite">executor.py:202-208</span>），重连的沙箱 lease 上下文必须与 Run 完全一致（project/task/snapshot/digest，<span class="cite">executor.py:214-223</span>）。<b>恢复绝不静默换镜像或换快照</b>。</p>
+<p>沙箱采用<b>按需创建</b>：只在工具第一次需要时才创建（<span class="cite">executor.py:138-145</span>）—— 纯闲聊的 Run 可能根本不需要沙箱。</p>
+
+<h2>5. 失败重试：有限次 + 退避</h2>
+<p><code>_handle_failure</code>（<span class="cite">executor.py:318-340</span>）：</p>
+<pre><code>failure_class, retryable = classify_error(error)      # 错误分类（第 5 小节）
+if retryable and attempts &lt; self._max_retries:
+    delay = timedelta(seconds=self._backoff_base * (2**attempts))   # 指数退避
+    self._store.schedule_retry(claimed.lease, attempt=attempts + 1,
+                               failure_kind=failure_class, delay=delay, now=self._clock())
+    return self._get_run(claimed.run.id)
+if retryable and attempts &gt;= self._max_retries:
+    error = RetryLimitExceeded(f"Run 自动重试达到上限：{self._max_retries}")
+return self._fail_claim(claimed, error, failure_class, cause=root_error)</code></pre>
+<ul>
+<li><b>哪些错可重试</b>：只有模型超时/上游错误/限流、沙箱超时/输出超限/沙箱丢失（<span class="cite">orchestration/errors.py:65-84</span>）。策略拒绝、凭据阻断这类错误<b>不可重试</b> —— 重试也白搭。</li>
+<li><b>重试计数持久化</b>：<code>run_retry_attempts</code> 表（<code>count_retry_attempts</code>，<span class="cite">repository.py:1097-1103</span>）—— 重启后计数不丢，不会无限重试。</li>
+<li><b>预算耗尽</b>：不是失败，是 <code>WAITING(BUDGET_EXHAUSTED)</code> —— 等用户决定（<span class="cite">executor.py:322-324</span>）。</li>
+<li>配置里的 <code>max_consecutive_failures = 3</code> 与 <code>max_run_duration_seconds = 3600</code> 是 DataHarness 层的限制（第 04 课）。</li>
+</ul>
+
+<h2>6. 取消：意图与执行的分离</h2>
+<p>回顾第 05 课：<code>request_cancel</code> 只记意图。Worker 侧执行取消（<span class="cite">executor.py:410-432</span>）：</p>
+<pre><code># 先终止外部副作用（沙箱），再提交终态；旧 worker 无法用旧 epoch 越过此提交。
+if self._sandbox is not None and checkpoint is not None and checkpoint.sandbox_id:
+    lease = await self._sandbox.connect(checkpoint.sandbox_id)
+    await self._sandbox.terminate(lease)                    # ① 先杀沙箱
+now = self._clock()
+with self._store.unit_of_work(immediate=True) as uow:
+    stored = uow.repo.get_run(claimed.run.id)
+    updated = stored.value.cancel(now)                      # ② 再提交 CANCELLED
+    result = uow.repo.save_run(updated, stored.version, "RUN_CANCELLED",
+                               lease=claimed.lease, lease_checked_at=now)
+self._cancel_task(result)                                   # ③ 任务跟着取消
+if self._workspace is not None:
+    self._workspace.cleanup_staging(result.project_id, result.task_id)  # ④ 清理未发布产物</code></pre>
+<p>顺序是纪律：<b>先消除副作用，再落终态</b>。已正式发布的产物保留，未提交的 staging 清理（<span class="cite">ARCHITECTURE.md:495-497</span>）。取消接口幂等（<code>request_cancel</code> 只在没有意图时写时间戳）。</p>
+
+<h2>7. 崩溃恢复全景</h2>
+<div class="diagram">Worker 执行中崩溃（进程死、断电、蓝屏）
+  │
+  ├─ lease 30 秒后过期（默认 lease_duration=30s，worker.py:168）
+  │
+  ├─ 下一个 Worker claim_next_run 选中它：recovered=True，epoch+1
+  │
+  ├─ _recovery_decision：
+  │     ├─ 有 checkpoint + 沙箱在 → RESUME_FROM_CHECKPOINT（续跑）
+  │     ├─ 有 checkpoint + 沙箱没  → REBUILD_SANDBOX（重建续跑）
+  │     └─ 无 checkpoint           → START_FROM_BEGINNING（从头，但快照不变）
+  │
+  └─ checkpoint 校验：digest 一致、快照一致，否则 PolicyDeniedError</div>
+<p>关键保证：<b>恢复永远使用原 ProjectSnapshot</b>（<span class="cite">ARCHITECTURE.md:483-484</span>）—— 文件更新不会偷换 Run 的输入视图。而 checkpoint（第 08 课）保证「已完成的分析步骤不重跑」。</p>
+
+<h2>8. Worker 与健康汇报</h2>
+<p>Worker 由 <code>cli.py:52</code> 的 <code>dataharness worker</code> 命令启动，装配在 <code>worker.py:116-125</code>（<code>build_local_worker</code>）。它把 API 重启与任务执行解耦 —— <b>API 进程不持有 Worker</b>（<span class="cite">worker.py:1-6</span>），所以 API 重启不会取消正在跑的长任务。</p>
+<p>监督健康文件 <code>WorkerHealthWriter</code>（<span class="cite">worker.py:176-224</span>）：只写 pid、owner、状态、活动 Run ID 的小 JSON（原子替换），不含任何业务内容。API 的 <code>/diagnostics</code> 只读这个投影（<span class="cite">api/services.py:169-192</span>）。注意区分两个「心跳」：这个文件心跳是给运维看的；SQLite 的 lease 心跳是并发安全机制。</p>
+
+<h2>9. 练习</h2>
+<div class="practice">
+<strong>练习：推演并发事故</strong>
+<ol>
+<li>读 <code>storage/store.py</code> 的 <code>claim_next_run</code>（34-100 行），画出两个 Worker 同时领取同一个 Run 的时序，标出 CAS 在哪个时刻拒绝第二个。</li>
+<li>读 <code>executor.py</code> 的 <code>_commit_outcome</code>（236-305 行），说出三路分支（cancel_requested / WAITING / 成功）分别怎么处理。</li>
+<li>在 <code>orchestration/errors.py</code> 找到 <code>classify_error</code>（65-84 行），列出 4 个可重试与 4 个不可重试的错误类型。</li>
+<li>思考题：为什么「重试计数」必须存在数据库而不是内存？</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：Worker A 的 lease 过期后，谁可以执行这个 Run？</h4>
+<div class="options">
+  <button class="option" data-correct="false">只有 Worker A 自己，等它恢复</button>
+  <button class="option" data-correct="false">谁都不行，Run 永远卡住</button>
+  <button class="option" data-correct="true">任意 Worker 都可以原子回收（epoch+1）并接管</button>
+  <button class="option" data-correct="false">需要人工手动改数据库</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>claim_next_run</code> 的条件 ②（<span class="cite">store.py:50-57</span>）：<code>status='RUNNING' AND lease_expires_at &lt;= now</code> 的 Run 可被回收。新 epoch 使旧 Worker 的所有提交失效（fencing）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：模型超时（MODEL_TIMEOUT）导致的失败会怎样？</h4>
+<div class="options">
+  <button class="option" data-correct="false">直接 FAILED，不再尝试</button>
+  <button class="option" data-correct="true">属于可重试错误，指数退避后重新入队，最多重试 max_retries 次</button>
+  <button class="option" data-correct="false">WAITING(BUDGET_EXHAUSTED)</button>
+  <button class="option" data-correct="false">CANCELLED</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+模型超时是暂时性问题（<span class="cite">orchestration/errors.py:65-84</span>），走 <code>schedule_retry</code> 的退避重试（<span class="cite">executor.py:329-336</span>）；次数达到上限才 FAILED。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 14 节「本地耐久执行」与第 15 节「取消语义」（<span class="cite">ARCHITECTURE.md:473-497</span>），
+以及经典文章 <a href="https://martinfowler.com/articles/patterns-of-distributed-systems/fencing.html">Fencing Tokens</a>（分布式系统模式，理解为什么 epoch 防呆）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「lease 到期但还没被回收时，旧 Worker 为什么提交不了？」「START_FROM_BEGINNING 会不会重复执行已完成的步骤？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="10-sandbox-execution.html">上一课：沙箱执行</a>
+  <a class="next" href="12-verification-lineage.html">下一课：验证门与血缘</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 11 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

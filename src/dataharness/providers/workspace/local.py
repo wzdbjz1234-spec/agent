@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
 import unicodedata
 from pathlib import Path, PurePath
@@ -13,6 +14,7 @@ from dataharness.domain import (
     FileId,
     FileVersionId,
     ProjectId,
+    SnapshotId,
     StepId,
     TaskId,
     compute_content_hash,
@@ -29,7 +31,16 @@ _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 _EXECUTABLE_SUFFIXES = frozenset(
     {".exe", ".com", ".bat", ".cmd", ".ps1", ".sh", ".dll", ".so", ".dylib"}
 )
-_PROJECT_DIRS = ("sources", "extracted", "indexes", "datasets", "artifacts", "manifests", "tasks")
+_PROJECT_DIRS = (
+    "sources",
+    "snapshots",
+    "extracted",
+    "indexes",
+    "datasets",
+    "artifacts",
+    "manifests",
+    "tasks",
+)
 _WINDOWS_RESERVED = frozenset(
     {
         "CON",
@@ -184,6 +195,40 @@ class LocalWorkspace:
     def index_path(self, project_id: ProjectId) -> Path:
         return self._within(project_id, "indexes", "corpus.sqlite3")
 
+    def snapshot_path(self, project_id: ProjectId, snapshot_id: SnapshotId) -> Path:
+        """返回仅包含指定 Snapshot 输入的只读挂载目录。"""
+        return self._within(project_id, "snapshots", snapshot_id, must_exist=True)
+
+    def materialize_snapshot(
+        self,
+        project_id: ProjectId,
+        snapshot_id: SnapshotId,
+        files: tuple[tuple[FileId, FileVersionId, str], ...],
+    ) -> None:
+        """追加创建 Snapshot 视图，避免 Sandbox 通过项目根目录看到未来版本。
+
+        Snapshot 文件版本本身是不可变的，因此这里可以复制成独立只读视图。相同
+        Snapshot 的重放只验证已有文件 hash，不允许用新内容覆盖旧 Run 的输入视图。
+        """
+        self.create_project(project_id)
+        directory = self._within(project_id, "snapshots", snapshot_id)
+        directory.mkdir(exist_ok=True)
+        for file_id, version_id, name in files:
+            source = self.source_path(project_id, file_id, version_id, name)
+            target_name = normalize_filename(name)
+            target = self._within(project_id, "snapshots", snapshot_id, target_name)
+            if target.exists():
+                if compute_content_hash(target.read_bytes()) != compute_content_hash(
+                    source.read_bytes()
+                ):
+                    raise ResourceIntegrityError("Snapshot 视图已存在不同内容")
+                continue
+            temporary = target.with_name(f".{target.name}.writing")
+            temporary.unlink(missing_ok=True)
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, target)
+            target.chmod(stat.S_IREAD)
+
     def write_manifest(self, project_id: ProjectId, name: str, data: bytes) -> WorkspaceResource:
         """只创建一次不可变清单；相同内容重放幂等，不同内容拒绝覆盖。"""
         self.create_project(project_id)
@@ -241,18 +286,30 @@ class LocalWorkspace:
     def write_task_state(
         self, project_id: ProjectId, task_id: TaskId, name: str, data: bytes
     ) -> WorkspaceResource:
-        """原子写 Task 状态；``RUN.json`` 创建后不可覆盖。"""
-        allowed = {"PLAN.md", "PROGRESS.md", "CONTEXT.md", "RUN.json"}
+        """原子写 Task 状态；用户问题和 ``RUN.json`` 创建后不可覆盖。
+
+        ``PROMPT.json`` 也放在 state 命名空间，而不是 Runtime SQLite。它是一次用户
+        输入的不可变载荷，Worker 只按 ``Task.prompt_hash`` 校验后读取，避免重启或
+        重试时从 HTTP 内存状态猜测原始问题。
+        """
+        allowed = {
+            "PROMPT.json",
+            "ANSWER.json",
+            "PLAN.md",
+            "PROGRESS.md",
+            "CONTEXT.md",
+            "RUN.json",
+        }
         if name not in allowed:
             raise UnsafePathError("Task state 只允许固定清单文件")
         self.create_task(project_id, task_id)
         target = self._within(project_id, "tasks", task_id, "state", name)
-        if name == "RUN.json" and target.exists():
+        if name in {"PROMPT.json", "RUN.json"} and target.exists():
             if compute_content_hash(target.read_bytes()) != compute_content_hash(data):
-                raise ResourceIntegrityError("RUN.json 是不可变复现清单")
+                raise ResourceIntegrityError(f"{name} 是不可变 Task 载荷")
         else:
             self._atomic_write(target, data)
-            if name == "RUN.json":
+            if name in {"PROMPT.json", "RUN.json"}:
                 target.chmod(stat.S_IREAD)
         return WorkspaceResource(
             project_id=project_id,
@@ -267,7 +324,14 @@ class LocalWorkspace:
         self, project_id: ProjectId, task_id: TaskId, name: str, max_bytes: int = 10 * 1024 * 1024
     ) -> bytes:
         """只从受控 Task state 目录读取文件，并限制单次读取大小。"""
-        if name not in {"PLAN.md", "PROGRESS.md", "CONTEXT.md", "RUN.json"}:
+        if name not in {
+            "PROMPT.json",
+            "ANSWER.json",
+            "PLAN.md",
+            "PROGRESS.md",
+            "CONTEXT.md",
+            "RUN.json",
+        }:
             raise UnsafePathError("Task state 只允许读取固定清单文件")
         if max_bytes <= 0:
             raise ValueError("max_bytes 必须为正数")
@@ -394,6 +458,18 @@ class LocalWorkspace:
             content_hash=record.content_hash,
             byte_size=record.byte_size,
         )
+
+    def read_published_resource(
+        self, record: PublicationRecord, max_bytes: int = 10 * 1024 * 1024
+    ) -> bytes:
+        """读取已经 AVAILABLE 且 hash/大小通过校验的受控产物。"""
+        if max_bytes <= 0:
+            raise ValueError("max_bytes 必须为正数")
+        target = self._published_path(record)
+        self._verify(target, record)
+        if record.byte_size > max_bytes:
+            raise ResourceIntegrityError("正式产物超过读取上限")
+        return target.read_bytes()
 
     def publish_staged(self, record: PublicationRecord) -> WorkspaceResource:
         source = self.staging_path(

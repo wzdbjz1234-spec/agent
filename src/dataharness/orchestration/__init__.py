@@ -12,7 +12,7 @@ from .errors import (
 )
 from .models import ExecutionDecision, FailureClass, RecoveryDecision, RunOutcome
 from .protocols import RunExecutionContext, RunHandler, SandboxSpecFactory
-from .services import RunService, TaskService
+from .services import RunService, SessionService, TaskService
 
 __all__ = [
     "BudgetExhaustedError",
@@ -29,6 +29,7 @@ __all__ = [
     "RunHandler",
     "RunOutcome",
     "RunService",
+    "SessionService",
     "SandboxSpecFactory",
     "TaskService",
     "classify_error",

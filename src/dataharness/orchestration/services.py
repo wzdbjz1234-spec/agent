@@ -6,20 +6,24 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import datetime
 
 from dataharness.domain import (
     ProjectId,
+    ProjectStatus,
     Run,
     RunId,
     RunStatus,
+    Session,
     SessionId,
     SnapshotId,
     Task,
     TaskId,
     TaskStatus,
     WaitReason,
+    compute_content_hash,
     utcnow,
 )
 from dataharness.idgen import IdFactory, UuidIdFactory
@@ -43,21 +47,77 @@ class TaskService:
         self._clock = clock
         self._workspace = workspace
 
-    def create(self, project_id: ProjectId, session_id: SessionId | None = None) -> Task:
-        """创建 QUEUED Task，并建立隔离的 Task working/staging/state 命名空间。"""
+    def create(
+        self,
+        project_id: ProjectId,
+        session_id: SessionId | None = None,
+        *,
+        prompt: str | None = None,
+    ) -> Task:
+        """创建 QUEUED Task，并持久化不可变的受控用户问题载荷。
+
+        Runtime 只接收 ``prompt_ref`` 与 ``prompt_hash``；真正的文本写入 Task state
+        目录，Worker 恢复时重新校验哈希后才交给 ModelGateway。旧的内部调用可以不传
+        prompt，但用户可见的 Phase 11 提交路径应始终传入非空问题。
+        """
+        if prompt is not None:
+            prompt = prompt.strip()
+            if not prompt:
+                raise ValueError("用户问题不能为空")
+            if len(prompt) > 100_000:
+                raise ValueError("用户问题超过 100000 字符上限")
         now = self._clock()
+        task_id = TaskId(self._ids.new("task"))
+        prompt_ref = None
+        prompt_hash = None
+        prompt_payload: bytes | None = None
+        if prompt is not None:
+            prompt_ref = f"task:{task_id}:state:PROMPT.json"
+            prompt_payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": str(task_id),
+                    "project_id": str(project_id),
+                    "session_id": str(session_id) if session_id else None,
+                    "prompt": prompt,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            prompt_hash = compute_content_hash(prompt_payload)
         task = Task(
-            id=TaskId(self._ids.new("task")),
+            id=task_id,
             project_id=project_id,
             session_id=session_id,
+            prompt_ref=prompt_ref,
+            prompt_hash=prompt_hash,
             created_at=now,
             updated_at=now,
         )
+        # 先只读校验 Project/Session 归属，避免参数错误时创建孤立 Workspace 目录。
         with self._store.unit_of_work() as uow:
-            uow.repo.get_project(project_id)
-            uow.repo.add_task(task)
+            project = uow.repo.get_project(project_id).value
+            if project.status != ProjectStatus.ACTIVE:
+                raise ValueError("归档项目不能创建新 Task")
+            if session_id is not None:
+                session = uow.repo.get_session(session_id)
+                if session.project_id is not None and session.project_id != project_id:
+                    raise ValueError("Session 只能绑定一个 Project")
         if self._workspace is not None:
+            # 先准备 Workspace 载荷，再提交 Runtime 事实；磁盘失败不会留下一个无法
+            # 恢复 prompt 的 QUEUED Task。若后续 DB 事务失败，遗留目录只是可重建的
+            # Workspace 派生物，不会成为控制面事实。
             self._workspace.create_task(project_id, task.id)
+            if prompt_payload is not None:
+                # PROMPT.json 由 Workspace 自己执行不可变与路径校验；这里不把文件路径
+                # 写回 Runtime，worker 只使用固定逻辑引用。
+                self._workspace.write_task_state(project_id, task.id, "PROMPT.json", prompt_payload)
+        with self._store.unit_of_work() as uow:
+            project = uow.repo.get_project(project_id).value
+            if project.status != ProjectStatus.ACTIVE:
+                raise ValueError("归档项目不能创建新 Task")
+            uow.repo.add_task(task)
         return task
 
     def get(self, task_id: TaskId) -> Task:
@@ -164,3 +224,43 @@ class RunService:
     def latest_checkpoint(self, run_id: RunId):
         with self._store.unit_of_work() as uow:
             return uow.repo.latest_checkpoint(run_id)
+
+
+class SessionService:
+    """Project-scoped Session 的创建和查询服务。"""
+
+    def __init__(
+        self,
+        store: SqliteRuntimeStore,
+        *,
+        id_factory: IdFactory | None = None,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
+        self._store = store
+        self._ids = id_factory or UuidIdFactory()
+        self._clock = clock
+
+    def create(self, project_id: ProjectId, label: str | None = None) -> Session:
+        """创建固定属于一个 Project 的 Session。"""
+        now = self._clock()
+        session = Session(
+            id=SessionId(self._ids.new("session")),
+            project_id=project_id,
+            label=label.strip() if label and label.strip() else None,
+            created_at=now,
+        )
+        with self._store.unit_of_work() as uow:
+            project = uow.repo.get_project(project_id).value
+            if project.status != ProjectStatus.ACTIVE:
+                raise ValueError("归档项目不能创建新 Session")
+            uow.repo.add_session(session)
+        return session
+
+    def get(self, session_id: SessionId) -> Session:
+        with self._store.unit_of_work() as uow:
+            return uow.repo.get_session(session_id)
+
+    def list_for_project(self, project_id: ProjectId) -> tuple[Session, ...]:
+        with self._store.unit_of_work() as uow:
+            uow.repo.get_project(project_id)
+            return uow.repo.list_sessions(project_id)

@@ -98,7 +98,9 @@ class ProjectCorpus:
         """
         normalized_name = normalize_filename(logical_name or source.name)
         size, content_hash = self._workspace.inspect_import(source)
-        with self._store.unit_of_work() as uow:
+        # 同名导入需要在读取当前版本与分配下一个版本号之间串行化。否则两个浏览器请求
+        # 都可能观察到相同版本号，随后触发唯一约束或留下难以解释的导入失败。
+        with self._store.unit_of_work(immediate=True) as uow:
             project = uow.repo.get_project(project_id).value
             if project.status != ProjectStatus.ACTIVE:
                 raise ValueError("归档项目不能导入新文件")
@@ -187,7 +189,12 @@ class ProjectCorpus:
         """固定全部逻辑文件的当前版本、处理状态、索引与 Dataset 版本。"""
         with self._store.unit_of_work() as uow:
             project = uow.repo.get_project(project_id).value
+            # Snapshot 会形成新的可执行输入边界。归档项目仅供读取既有历史，不允许再
+            # 通过绕过 WebUI 的 API 产生新的执行前提。
+            if project.status != ProjectStatus.ACTIVE:
+                raise ValueError("归档项目不能创建新的 Snapshot")
             versions = uow.repo.list_current_file_versions(project_id)
+            file_names = {item.id: uow.repo.get_file(item.file_id).name for item in versions}
             datasets = uow.repo.list_project_datasets(project_id)
             snapshot = ProjectSnapshot(
                 id=SnapshotId(self._ids.new("snapshot")),
@@ -209,6 +216,12 @@ class ProjectCorpus:
                 dataset_version_ids=tuple(item.id for item in datasets),
             )
             uow.repo.add_snapshot(snapshot)
+        snapshot_files = tuple(
+            (entry.file_id, entry.file_version_id, file_names[entry.file_version_id])
+            for entry in snapshot.entries
+            if entry.status == FileVersionStatus.READY
+        )
+        self._workspace.materialize_snapshot(project_id, snapshot.id, snapshot_files)
         manifest = {
             "project_id": str(snapshot.project_id),
             "snapshot_id": str(snapshot.id),

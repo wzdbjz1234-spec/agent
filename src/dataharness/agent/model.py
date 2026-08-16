@@ -15,8 +15,10 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from dataharness.domain import TaskId
-from dataharness.privacy import ModelGateway
+from dataharness.domain import RunId, TaskId
+from dataharness.privacy import ModelGateway, ModelProviderError
+
+from .diagnostics import log_model_error, log_model_output
 
 
 def _render_request(messages: list[ModelMessage], info: AgentInfo) -> str:
@@ -50,6 +52,8 @@ def _response_part(text: str) -> TextPart | ToolCallPart:
     except json.JSONDecodeError:
         return TextPart(content=text)
     if not isinstance(payload, dict) or "tool_call" not in payload:
+        if isinstance(payload, dict) and isinstance(payload.get("content"), str):
+            return TextPart(content=payload["content"])
         return TextPart(content=text)
     tool_call = payload["tool_call"]
     if not isinstance(tool_call, dict) or not isinstance(tool_call.get("name"), str):
@@ -64,12 +68,22 @@ def _response_part(text: str) -> TextPart | ToolCallPart:
     )
 
 
-def gateway_function_model(gateway: ModelGateway, task_id: TaskId) -> FunctionModel:
+def gateway_function_model(
+    gateway: ModelGateway, task_id: TaskId, run_id: RunId | None = None
+) -> FunctionModel:
     """创建所有请求都经 ModelGateway 的异步 FunctionModel。"""
 
     async def request(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         prompt = _render_request(messages, info)
-        prepared = await asyncio.to_thread(gateway.complete, task_id, prompt)
+        try:
+            prepared = await asyncio.to_thread(gateway.complete, task_id, prompt)
+        except ModelProviderError as error:
+            log_model_error(task_id, run_id=run_id, error_code=error.code)
+            raise
+        except Exception as error:  # noqa: BLE001 — 只记录异常类型，不记录正文
+            log_model_error(task_id, run_id=run_id, error_type=type(error).__name__)
+            raise
+        log_model_output(gateway, task_id, prepared.cloud_text, run_id=run_id)
         return ModelResponse(parts=[_response_part(prepared.cloud_text)], model_name="gateway")
 
     function: Any = request

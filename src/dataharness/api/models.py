@@ -17,11 +17,18 @@ class CreateProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
+class CreateSessionRequest(BaseModel):
+    """创建固定属于当前 Project 的连续对话 Session。"""
+
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+
+
 class CreateTaskRequest(BaseModel):
-    """创建 Task 时显式固定的 Snapshot。"""
+    """创建 Task 时固定 Snapshot，并接收用户问题的受控载荷。"""
 
     project_snapshot_id: str = Field(min_length=1, max_length=255)
     session_id: str | None = Field(default=None, min_length=1, max_length=255)
+    prompt: str | None = Field(default=None, min_length=1, max_length=100_000)
 
 
 class RetryTaskRequest(BaseModel):
@@ -60,6 +67,7 @@ class TaskAnswer(BaseModel):
 
     task_id: str
     task_status: str
+    answer: str | None = None
     run_ids: tuple[str, ...]
     findings: tuple[Finding, ...]
     datasets: tuple[Dataset, ...]

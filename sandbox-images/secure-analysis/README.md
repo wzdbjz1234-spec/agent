@@ -17,9 +17,11 @@ docker 后端不提供只读根挂载，语义见 `ARCHITECTURE.md` 8.4）。
 构建与证据：
 
 ```powershell
-./build.ps1 -BaseImage '<mirror>/python:3.12-slim@sha256:<digest>' -Tag 'secure-analysis:1.0.0'
+./build.bat -BaseImage '<mirror>/python:3.12-slim@sha256:<digest>' -Tag 'secure-analysis:1.0.0'
 python scan_vulns.py build-evidence/sbom.spdx.json build-evidence/vuln-scan.json
 ```
+
+`build.bat` 是启动器，等价引擎脚本是 `build.ps1`（可在 pwsh 中直接运行）。
 
 - `build-evidence/image-digest.txt`：本次构建的锁定 digest（`sha256:<64 hex>`）。
 - `build-evidence/sbom.spdx.json`：`docker scout sbom` 生成的 147 包 SBOM。

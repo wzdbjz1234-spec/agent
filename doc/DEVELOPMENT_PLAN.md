@@ -1,7 +1,7 @@
-# DataHarness V1 Development Plan
+# DataHarness Development Plan
 
 > Status: Approved baseline
-> Plan version: 1.1
+> Plan version: 1.2
 > Architecture source: `ARCHITECTURE.md`
 
 ## 1. Purpose
@@ -36,14 +36,26 @@
 | 08 | Agent assembly, Skills and context | agent, skills, memory | 04, 06–07 | COMPLETED | [phase-08-agent-20260814-01.md](phase-08-agent-20260814-01.md) |
 | 09 | Verification, HTTP and observability | analysis, api, observability | 03–08 | COMPLETED | [phase-09-api-verification-20260814.md](phase-09-api-verification-20260814.md) |
 | 10 | E2E hardening and V1 release | all modules | 00–09 | COMPLETED | [phase-10-v1-release-20260814.md](phase-10-v1-release-20260814.md) |
+| 11 | Production Agent Harness | agent, orchestration, model provider, api | 04–10 | COMPLETED | [phase-11-production-agent-harness-20260815.md](phase-11-production-agent-harness-20260815.md) |
+| 12 | Local WebUI | web, api | 11 | COMPLETED | [phase-12-local-webui-20260815.md](phase-12-local-webui-20260815.md) |
+| 13 | One-command local deployment | scripts, api, worker, OpenSandbox | 11–12 | IN_PROGRESS | [partial report](phase-13-local-deployment-20260815.md) |
+| 14 | Team deployment preparation | architecture, deployment, security | 13 | IN_PROGRESS | [partial report](phase-14-team-deployment-preparation-20260815.md) |
 
 Critical path:
 
 `00 -> 01 -> 02 -> 03 -> 05 -> 06 -> 07 -> 08 -> 09 -> 10`
 
+本机应用化关键路径：
+
+`10 -> 11 -> 12 -> 13`
+
+Phase 14 只准备从个人本机工具迁移到团队内部平台的边界，不在个人版中提前实现多租户或分布式基础设施。
+
 Phase 04 可在 Phase 03 期间并行实现，但 Phase 06 和 Phase 08 的验收都依赖它。
 
 Version 1.1 将 ProjectCorpus、不可变文件版本、ProjectSnapshot、RELEVANT/FULL_PROJECT 跨文件处理纳入 V1 基线；决策记录见 `decision-001-project-corpus.md`。
+
+Version 1.2 在已发布的核心 Harness 后追加生产 Agent 闭环、本机 WebUI 和一键部署阶段；不修改 Phase 00–10 的历史完成事实。决策记录见 [decision-002-local-agent-application.md](decision-002-local-agent-application.md)。
 
 ## 4. Cross-phase quality gates
 
@@ -329,6 +341,111 @@ Exit Gate:
 
 Required report: `doc/phase-10-v1-release-YYYYMMDD.md`
 
+### Phase 11 — Production Agent Harness
+
+Objective：把 Phase 04–10 已有的模型边界、Agent 工厂、上下文、耐久执行、Sandbox 和验证组件装配成可由用户问题驱动的生产运行闭环。
+
+Deliverables:
+
+- 扩展 Task 创建输入，持久化用户 `prompt` 的受控 Workspace 载荷；Runtime SQLite 只保存稳定引用、hash 和状态，不保存原始模型载荷。
+- Session 固定绑定一个 Project；同一 Session 的每次用户消息创建新 Task，每个 Task 固定创建时的 ProjectSnapshot，不跨 Project 检索历史。
+- 实现首个 OpenAI-compatible `CloudModelProvider`，从本地配置读取 `model`、`base_url`、超时和 `api_key`；所有模型、摘要和压缩调用继续经过 ModelGateway。
+- 实现 `AgentRunHandler`，按 Run 装配 AgentRunner、AnalysisRuntime、ContextCheckpointManager、SkillRegistry、可选 MemoryCapability 和 Sandbox lease，并把结构化 Agent 输出映射为 RunOutcome。
+- 保持单 PydanticAI Agent；计划、执行、发布、验证、预算、重试和恢复由确定性 Host Harness 管理，不新增 Planner/Reviewer Agent 或第二套 agent loop。
+- 补齐 Agent 工具输入/输出声明：ProjectFileVersion/Dataset 受控输入、ExpectedOutput、表格预览、Project Coverage、Python/SQL、输出检查和 Finding 提交。
+- 完成 Dataset、Artifact、ChartArtifact、Lineage 和 Finding 的发布与验证闭环；图表使用受控 Vega-Lite JSON，且可生成 PNG/SVG 兜底产物。
+- 上下文分为当前消息、结构化工作状态、稳定事实引用和 Session 历史四层；在关键 AnalysisStep、发布、验证、WAITING、完成及压缩边界保存 checkpoint。
+- 自动估算上下文预算并触发 compaction；保留当前问题、系统约束、Snapshot、稳定资源引用、未解决问题和最近工具调用，摘要不得成为事实来源。
+- 实现 Project + Session 作用域的历史存储与检索，修复当前全局历史搜索可能跨边界命中的问题。
+- 新增 Worker CLI 和生命周期装配；预算内允许 Agent 自动检索与执行，歧义、缺少输入、策略阻断、预算耗尽或不支持能力时进入带稳定原因的 WAITING。
+- 新增基于 Runtime 事件序号的 SSE Task event stream；断线重连可补发事件，SSE 不作为事实源，也不暴露隐藏思考过程或敏感原文。
+
+Exit Gate:
+
+- 通过 HTTP 提交真实问题后，Worker 自动领取 Run，模型至少调用一个受控项目工具，并最终产生 COMPLETED 或有明确原因的 WAITING。
+- 真实 Provider 不可绕过 ModelGateway；缺少 API Key、服务超时、无效响应和额度错误映射为稳定且脱敏的错误分类。
+- Python/SQL 只在通过 attestation 的 OpenSandbox 中运行；输入绑定固定 Snapshot，输出只有经 Host 发布后可见。
+- Worker 或 Host 在关键 checkpoint 后崩溃并重启时恢复同一 Run，不重复已经正式提交的 AnalysisStep 或发布对象。
+- Session 历史不会跨 Project 泄露；新上传文件不会改变旧 Task 的 Snapshot、上下文或证据链。
+- 上下文压缩后仍能从稳定引用重建事实；摘要、模型原文或工具摘要不能伪造 Dataset、Artifact、Finding 或 lineage。
+- 图表规范不允许外部 URL、任意 JavaScript、HTML、iframe 或未发布 Dataset 引用；hash 漂移时 fail closed。
+- fake cloud E2E、真实 OpenSandbox 集成测试和可选真实模型 smoke test 有独立命令及证据；默认测试不使用真实云凭据。
+
+Required report: `doc/phase-11-production-agent-harness-YYYYMMDD.md`
+
+### Phase 12 — Local WebUI
+
+Objective：为个人本机用户提供项目、文件、连续对话、任务执行和证据结果的一体化浏览器工作台。
+
+Deliverables:
+
+- 在 `web/` 建立 React、TypeScript 和 Vite 应用，使用 Ant Design、TanStack Query、React Router 与 Vega-Lite；根据 FastAPI OpenAPI 生成或校验 TypeScript API 类型。
+- 实现 `/projects` 项目列表，以及项目创建、归档和最近任务入口。
+- 实现 `/projects/{project_id}` 项目工作台：文件上传、版本、处理状态、检索和 Session 创建。
+- 实现 `/projects/{project_id}/sessions/{session_id}` 对话界面：自由问题、快捷分析模板、连续追问、取消、恢复和 WAITING 输入。
+- 实现 `/tasks/{task_id}` 结果页面：最终回答、Dataset、Artifact、Finding、证据、lineage、图表与可展开工具轨迹。
+- 建立统一 ChartRenderer：默认渲染已验证的 Vega-Lite JSON，失败时回退 PNG/SVG，并提供图表、数据表和说明切换。
+- 使用 SSE 显示简化任务进度；工具名称、耗时、输入/输出摘要和资源引用按需展开，不展示隐藏思考过程。
+- 提供本地诊断抽屉，显示 Docker、OpenSandbox、API、Worker、模型配置、镜像 digest、数据目录和磁盘占用；API Key 只显示已配置/未配置。
+- 开发期由 Vite 代理 API/SSE；发布构建由 FastAPI 同源托管，最终用户不需要 Node.js。
+- 建立组件测试、API mock 测试、可访问性检查和 Playwright 关键用户流程。
+
+Exit Gate:
+
+- 用户只通过 WebUI 即可创建 Project、上传文件、创建 Session、提交问题、观察执行、处理 WAITING 并查看最终证据结果。
+- 页面刷新和 SSE 断线不丢失事实状态；重新进入 Task 时从 API/Runtime 恢复，而不是依赖浏览器内存。
+- 前端不执行 Agent 生成的脚本、HTML 或任意 URL；图表和下载只读取经过验证的正式资源。
+- 大文件、大 Dataset 和长事件流使用分页、有界预览或下载，不把完整载荷无界加载到浏览器。
+- WebUI 构建产物可由 FastAPI 在回环地址同源提供；不存在生产 CORS 放宽或公网监听默认值。
+- Playwright 覆盖项目创建、文件上传、问题提交、SSE 进度、图表显示、取消、WAITING 和恢复。
+
+Required report: `doc/phase-12-local-webui-YYYYMMDD.md`
+
+### Phase 13 — One-command local deployment
+
+Objective：把个人本机应用固化为可检查、可启动、可停止、可恢复和可诊断的发布包。
+
+Deliverables:
+
+- 提供 `setup.ps1`：检查 Docker Desktop、uv、锁文件、端口和配置，安装 Python 依赖，构建/验证 secure-analysis 镜像，并生成不包含秘密的本地配置。
+- 提供 `start.ps1`、`stop.ps1` 和 `status.ps1`，统一管理 OpenSandbox Server、DataHarness API 和 DataHarness Worker 三个独立宿主进程。
+- API 同源托管预构建 WebUI；Docker 只按需运行受控 Sandbox、execd 和 egress 容器，不把 API/Worker 强制容器化。
+- 使用明确的 PID、日志和健康状态目录；重复启动幂等，停止时先停止领取新任务，再取消/清理外部执行并退出。
+- 启动前验证本地配置的 `api_key` 是否存在，但不打印、写入 Runtime 或发送到 Sandbox；诊断输出只显示配置状态。
+- 建立 Docker、OpenSandbox、Worker、模型 Provider、镜像 digest、允许挂载路径和端口冲突的预检及中文修复提示。
+- 记录 Runtime/Privacy/Project 数据备份、恢复、升级和卸载边界；默认操作不得删除用户数据。
+- 发布包包含锁文件、前端静态产物、配置样例、镜像构建证据、License/Notice、操作手册和故障排查清单。
+
+Exit Gate:
+
+- 在满足 Docker Desktop 与 uv 前置条件的干净 Windows 环境中，仅通过 `setup.ps1` 和 `start.ps1` 可打开 WebUI 并完成一条真实 Agent 分析链路。
+- API、Worker 或 OpenSandbox 任一进程异常退出时，`status.ps1` 能准确定位；重启后按 checkpoint 恢复或给出明确终态。
+- `start.ps1` 重复执行不会启动重复 Worker/OpenSandbox；`stop.ps1` 不误杀项目外进程，也不删除用户数据。
+- 发布环境不要求 Node.js，不默认绑定公网地址，不把 Docker socket、API Key、Runtime DB 或 Privacy DB 暴露给 Sandbox。
+- 备份恢复演练、端口冲突、Docker 未启动、模型密钥缺失和 OpenSandbox 配置错误均有自动化或可复现验收证据。
+
+Required report: `doc/phase-13-local-deployment-YYYYMMDD.md`
+
+### Phase 14 — Team deployment preparation
+
+Objective：在不提前实现团队平台的前提下，记录从个人本机工具迁移到内部多人服务所需的稳定边界和拆分顺序。
+
+Deliverables:
+
+- 形成 API/Web/Worker/OpenSandbox 独立部署拓扑和威胁模型，不把个人版回环安全假设沿用到共享环境。
+- 设计认证、RBAC、Project 租户隔离、审计、TLS、反向代理、CSRF/CORS 和密钥管理边界。
+- 评估 Runtime SQLite 向 PostgreSQL、LocalWorkspace 向对象存储、单机 Worker 向耐久队列迁移的 Adapter 与数据迁移策略。
+- 设计团队环境的并发配额、Sandbox 池、观测、备份、恢复、升级和容量基线。
+- 形成容器镜像和 Compose/Kubernetes 部署草案；未完成安全 Gate 前不得对外提供共享访问。
+
+Exit Gate:
+
+- 团队版决策文档明确列出信任边界、事实源、迁移顺序、兼容接口和不可沿用的个人版假设。
+- 核心 Domain、AgentRunHandler、API DTO 和 WebUI 不依赖本机进程管理实现，可由 Provider/Adapter 替换基础设施。
+- 未把文档设计描述成已实现能力；认证、多租户、在线数据库和高可用保持明确的后续状态。
+
+Required report: `doc/phase-14-team-deployment-preparation-YYYYMMDD.md`
+
 ## 6. Test ownership
 
 | Test layer | Owns | Must not do |
@@ -338,7 +455,9 @@ Required report: `doc/phase-10-v1-release-YYYYMMDD.md`
 | Integration | SQLite、Project 提取/索引、文件系统、OpenSandbox、PydanticAI 与 Adapter 组合 | 访问真实云账号或生产数据 |
 | E2E | 用户可见流程、崩溃恢复、安全不变量和发布证据 | 绕过 ModelGateway 或用 Host 执行替代 Sandbox |
 
-## 7. Definition of V1 done
+## 7. Definitions of done
+
+### 7.1 Core Harness V1
 
 只有同时满足以下条件，项目才可标记为 V1 完成：
 
@@ -348,6 +467,18 @@ Required report: `doc/phase-10-v1-release-YYYYMMDD.md`
 - 从干净环境可以使用锁文件和固定镜像 digest 复现验收。
 - 文档明确说明普通业务数据可能发送给用户配置的云模型，隐私检测为 best-effort。
 - V1 非目标没有被描述成已经实现的安全能力。
+
+Phase 00–10 的 `COMPLETED` 表示核心 Harness、控制面和发布证据已经完成，不等价于存在生产模型、自动 Worker、WebUI 或一键部署。
+
+### 7.2 Local application release
+
+个人本机应用只有同时满足以下条件才可发布：
+
+- Phase 11–13 均为 `COMPLETED`，每阶段有独立完成报告和 checkpoint commit。
+- 用户可以从 WebUI 提交问题并得到由真实 Agent、OpenSandbox 和 Verification Gate 产生的可追溯回答。
+- API、Worker 和 OpenSandbox 可由脚本独立管理，异常恢复、日志、诊断和备份流程有验收证据。
+- 前端不执行 Agent 生成的任意代码，模型调用不绕过 ModelGateway，Sandbox 不获得 Host 凭据或事实数据库。
+- 干净环境部署不要求 Node.js，不默认开放公网，也不把团队版能力描述成已经完成。
 
 ## 8. Plan maintenance
 

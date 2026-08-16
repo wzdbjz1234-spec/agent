@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 端到端实操 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 13 · 把前 12 课串起来</div>
+  <h1>端到端实操：跑通一次完整分析</h1>
+  <p class="subtitle">本课带你把整个系统跑起来：启动 → 建项目 → 导文件 → 建任务 → 看事件流 → 读答案。每一步都告诉你「刚刚发生了什么、对应哪一课的哪个模块」。</p>
+</header>
+<main>
+
+<h2>0. 准备</h2>
+<p>前置条件（<span class="cite">README.md:62-67</span>）：Python、uv、Docker Desktop。依赖安装：</p>
+<pre><code>uv sync --locked
+Copy-Item .\dataharness.example.toml .\dataharness.local.toml   # 若还没有本地配置</code></pre>
+<p>验证环境：</p>
+<pre><code>uv run dataharness --version
+uv run dataharness check --config .\dataharness.local.toml</code></pre>
+<div class="callout">
+<strong>关于模型 Key 的诚实说明</strong>
+<p>没有真实 API Key 时，<code>dataharness run</code> 会 fail closed 拒绝启动（<span class="cite">README.md:416-418</span>）。
+本课的主线流程（建项目/导文件/建快照/建任务/看事件）用 <code>dataharness serve</code> + 一个不执行模型调用的方式也能验证 —— 我们会明确标注每一步是否依赖真实模型。想看到 Agent 真实工作，请在 <code>dataharness.local.toml</code> 的 <code>[model].api_key</code> 填入你的 Key（<span class="cite">README.md:328-347</span>）。</p>
+</div>
+
+<h2>1. 启动 API</h2>
+<p>单独启动 API（不需要 Docker）：</p>
+<pre><code>uv run dataharness serve --config .\dataharness.local.toml --host 127.0.0.1 --port 8000</code></pre>
+<p>健康检查（<span class="cite">README.md:228-234</span>）：</p>
+<pre><code>Invoke-RestMethod http://127.0.0.1:8000/healthz     # {"status":"ok"}
+Invoke-RestMethod http://127.0.0.1:8000/readyz      # {"status":"ready"}</code></pre>
+<p>对应的代码在第 03 课读过：<span class="cite">api/app.py:134-141</span>。打开 <code>http://127.0.0.1:8000/docs</code> 能看到全部接口（Swagger UI）。</p>
+
+<h2>2. 创建 Project 并导入文件</h2>
+<pre><code>$project = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/projects `
+  -ContentType application/json -Body '{"name":"demo-project"}'
+$projectId = $project.id</code></pre>
+<p>这走的是 <code>POST /projects</code> → <code>corpus.create_project</code>（第 03/07 课）。造一个 CSV 并上传：</p>
+<pre><code>@("id,name,amount", "1,alpha,100", "2,beta,250", "3,gamma,80") | Set-Content -Path .\demo.csv -Encoding utf8
+curl.exe -X POST "http://127.0.0.1:8000/projects/$projectId/files" `
+  -H "X-File-Name: demo.csv" -H "Content-Type: application/octet-stream" --data-binary "@demo.csv"</code></pre>
+<p>看文件状态（应该是 READY）：</p>
+<pre><code>Invoke-RestMethod "http://127.0.0.1:8000/projects/$projectId/files"</code></pre>
+<p>刚才发生的事（第 07 课）：文件名规范化 → 原件存入 <code>runtime-data/projects/{id}/sources/</code> → 魔数识别 CSV → 提取 → FTS5 索引 → 版本标记 READY。你可以去目录里看看那三个产物。</p>
+
+<h2>3. 创建 Snapshot</h2>
+<p>V1 API 没有快照路由，用 Python 直接调服务（<span class="cite">README.md:292-295</span>）：</p>
+<pre><code>$snapshotId = uv run python -c "from pathlib import Path; from dataharness.api import ApiService; from dataharness.config import load_settings; from dataharness.domain import ProjectId; s=ApiService.from_settings(load_settings(Path('dataharness.local.toml'))); print(s.corpus.create_snapshot(ProjectId('$projectId')).id)"</code></pre>
+<p>这就是第 07 课的不可变快照：固定了当前所有文件的版本。从此这个 Run 的输入视图不会变。</p>
+
+<h2>4. 创建 Task</h2>
+<pre><code>$taskBody = @{ project_snapshot_id = $snapshotId; prompt = "分析 demo.csv 中金额的平均值" } | ConvertTo-Json
+$task = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/projects/$projectId/tasks" `
+  -ContentType application/json -Body $taskBody
+$taskId = $task.task.id</code></pre>
+<p>任务创建时同时创建了 Run（响应里能看见 <code>run.id</code>）。Task 进入 QUEUED —— 等待 Worker 领取。</p>
+<div class="callout">
+<strong>注意</strong>
+<p>只启动 <code>serve</code> 时没有 Worker，Task 会一直 QUEUED —— 这是设计：API 不执行任务（第 11 课「API 进程不持有 Worker」）。
+要让任务真正跑起来，要么启动 <code>dataharness worker</code>（需要沙箱和模型 Key），要么用 <code>dataharness run</code> 一键启动全家桶（第 5 节）。</p>
+</div>
+
+<h2>5. 一键启动全家桶（真实链路）</h2>
+<p>准备好 Docker Desktop、模型 Key、沙箱镜像后：</p>
+<pre><code>uv run dataharness run</code></pre>
+<p>它会（<span class="cite">launcher.py:245-339</span>，第 01 课提过）：依次启动 OpenSandbox（8080）→ API（8000）→ Worker，并在前台转发日志（前缀 <code>[sandbox]</code>/<code>[api]</code>/<code>[worker]</code>）。</p>
+<p>现在重新创建 Task（或刚才的 Task 会被新 Worker 领取）。Worker 日志里的 <code>[agent]</code> 记录模型的有界思考、工具调用与结果摘要（<span class="cite">README.md:411-413</span>）。</p>
+<h3>观察事件流（SSE）</h3>
+<p>任务执行时，用第二个 PowerShell 窗口订阅事件：</p>
+<pre><code>Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId/events"</code></pre>
+<p>你会看到一串事件：<code>TASK_CREATED → RUN_CLAIMED → RUN_PHASE_ADVANCED → STEP_STARTED → STEP_SUCCEEDED → RUN_SUCCEEDED → TASK_COMPLETED</code> 等。
+实时推送用 SSE（第 06 课）：</p>
+<pre><code>curl.exe -N "http://127.0.0.1:8000/tasks/$taskId/events/stream"</code></pre>
+<p>浏览器打开 WebUI <code>http://127.0.0.1:8000</code>，页面本身也是从这些事件恢复状态的（<span class="cite">README.md:246-248</span>）。</p>
+
+<h2>6. 读最终答案</h2>
+<pre><code>Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId/answer"</code></pre>
+<p>返回的 <code>TaskAnswer</code>（<span class="cite">api/models.py:58-76</span>）包含：answer 正文、findings（已过验证门的）、datasets、artifacts、lineage、disclosures（覆盖缺口/数据质量披露）。
+再查血缘：</p>
+<pre><code>Invoke-RestMethod "http://127.0.0.1:8000/tasks/$taskId/lineage"</code></pre>
+<p>你应该能看到 <code>FILE_VERSION → DATASET</code>、<code>STEP → DATASET</code> 这样的边（第 12 课）。</p>
+
+<h2>7. 故障演练：验证耐久性</h2>
+<p>想亲眼看到第 11 课的能力，可以做这个实验：</p>
+<ol>
+<li>创建一个耗时的 Task（prompt 要求「多步分析」）；</li>
+<li>在 Worker 执行中<b>杀进程</b>（<code>stop.bat</code> 或直接关掉窗口）；</li>
+<li>重新 <code>dataharness run</code>；</li>
+<li>观察事件流：<code>RUN_LEASE_RECOVERED</code> 出现，Run 从 checkpoint 继续而不是从头。</li>
+</ol>
+<p>这就是「lease 过期 → 原子回收 → 恢复决策 → 续跑」的真实演示（第 11 课）。</p>
+
+<h2>8. 故障排查速查</h2>
+<table>
+<thead><tr><th>现象</th><th>检查（<span class="cite">README.md:436-478</span>）</th></tr></thead>
+<tbody>
+<tr><td><code>dataharness check</code> 失败</td><td>TOML 格式、路径可写、<code>network_enabled=false</code></td></tr>
+<tr><td>API 能启动但 Task 不执行</td><td>是否用 <code>dataharness run</code>；<code>status.bat</code> 看 Worker 心跳/沙箱 TCP/digest/Key</td></tr>
+<tr><td>沙箱创建失败</td><td>8080 端口、docker info、digest 一致性、allowed_host_paths、egress 模式</td></tr>
+<tr><td>模型调用失败</td><td>Key 配置、Provider 错误分类（脱敏的稳定分类）</td></tr>
+</tbody>
+</table>
+
+<h2>9. 练习：把全流程画成图</h2>
+<div class="practice">
+<strong>练习：总结一张「数据流图」</strong>
+<ol>
+<li>在本课操作的基础上，画一张从「curl 建 Project」到「拿到 answer」的时序图，标注每一步经过的层（api → projects/corpus → storage → orchestration → agent → privacy → sandbox → analysis）。</li>
+<li>在图上标出三个「安全边界」：ModelGateway（第 09 课）、OpenSandbox 挂载（第 10 课）、Runtime/Privacy 分离（第 06/09 课）。</li>
+<li>把这张图和你第 01 课的「地图」对比，看看现在能画出多少细节。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：只启动 serve（没有 Worker），创建 Task 后会怎样？</h4>
+<div class="options">
+  <button class="option" data-correct="false">立刻执行并完成</button>
+  <button class="option" data-correct="false">报错 500</button>
+  <button class="option" data-correct="true">Task 保持 QUEUED，等待独立 Worker 领取</button>
+  <button class="option" data-correct="false">自动启动一个 Worker</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+API 与 Worker 是独立进程（<span class="cite">worker.py:1-6</span>）。Task 入队后由 Worker 循环领取（第 11 课）。所以完整链路要用 <code>dataharness run</code>（启动器同时拉起三个进程，<span class="cite">launcher.py:245-339</span>）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：SSE 事件流的游标是什么？断线后如何补发？</h4>
+<div class="options">
+  <button class="option" data-correct="false">时间戳，按时间补发</button>
+  <button class="option" data-correct="true">Runtime 事件的单调递增 ID；客户端带 Last-Event-ID 或 after 参数续传</button>
+  <button class="option" data-correct="false">没有游标，断线就丢</button>
+  <button class="option" data-correct="false">随机数，碰运气</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>api/app.py:268-302</code>：事件 ID 即游标，<code>Last-Event-ID</code> 头或 <code>after</code> 参数都支持；事件事实源是 SQLite 的 events 表（第 06 课），SSE 只是投影。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../README.md">README.md</a> 第 9 节「API 最小操作流程」与第 11 节「完整验收流程」，
+和 <a href="../doc/V1_OPERATIONS.md">doc/V1_OPERATIONS.md</a>（运维手册，部署前后必读）。</p>
+</div>
+
+<div class="ask">
+<strong>学完了？还有问题？</strong>
+<p>把任何疑问直接问你的 AI 老师 —— 它可以带你回看任何一课、任何一段代码，或者陪你做下一个练习。
+建议下一步：自己加一个新工具（比如 <code>count_rows</code>），走通「定义 → 注册到 assembly.py → 跑测试」的完整流程。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="12-verification-lineage.html">上一课：验证门与血缘</a>
+  <a class="next" href="index.html">返回课程首页</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a> · <a href="glossary.html">术语表</a></span>
+  <span>Lesson 13 / 13 · 恭喜学完！</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

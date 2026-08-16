@@ -24,7 +24,7 @@ CLI/最小应用入口、测试 fixtures 与统一验证脚本，不接入真实
 ### 配置模型 `src/dataharness/config.py`
 
 - `PathsConfig`（runtime_data_root / projects_root / privacy_root，子根缺省派生，`runtime_db` 属性）、
-  `ModelProviderConfig`（api_key 仅存环境变量名）、`SandboxConfig`（默认断网）、
+  `ModelProviderConfig`（api_key 来自本地配置）、`SandboxConfig`（默认断网）、
   `ExtractionConfig`、`IndexConfig`（BM25）、`BudgetConfig`、`ResourceLimitsConfig` 与顶层 `Settings`。
 - `load_settings(path)`：用内置 `tomllib` 解析 TOML 并经 Pydantic 校验。
 
@@ -51,7 +51,7 @@ CLI/最小应用入口、测试 fixtures 与统一验证脚本，不接入真实
 
 - 新增 `dataharness.config.Settings` / `load_settings`、`dataharness.idgen.*`、
   `dataharness.testing.*`、`dataharness.tooling.dependency_check.*` 与 `dataharness.cli.main`。
-- 配置不变量：默认 Sandbox 断网；密钥仅经环境变量名引用，不落配置/日志；子路径根缺省从
+- 配置不变量（历史基线）：默认 Sandbox 断网；当时密钥仅经环境变量名引用，不落配置/日志；当前实现改为从未纳入版本控制的本地 TOML 读取；子路径根缺省从
   runtime_data_root 派生；路径默认指向本地 `runtime-data/`。
 - 依赖方向规则固化于 `dependency_check.dataharness_rules()`。
 

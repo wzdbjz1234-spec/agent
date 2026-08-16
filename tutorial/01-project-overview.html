@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 项目概览 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 01 · 先建立整体地图</div>
+  <h1>项目概览：这个仓库是什么</h1>
+  <p class="subtitle">读完本课，你将对「DataHarness 能干什么、代码怎么组织、怎么跑起来」有一个整体印象。</p>
+</header>
+<main>
+
+<h2>1. 一句话概括</h2>
+<p>
+打开 <code>README.md</code> 第一段（<span class="cite">README.md:3</span>）：
+</p>
+<blockquote>
+DataHarness 是一个本地优先的数据分析 Agent Harness：Project 文件在本地版本化保存，Task/Run/Step 状态写入 Runtime SQLite，
+生成的 Python/SQL 只允许进入 OpenSandbox，模型请求统一经过 ModelGateway 的 secret/PII 边界。
+</blockquote>
+<p>拆开这句话，就是全项目的四个支柱：</p>
+<table>
+<thead><tr><th>支柱</th><th>含义</th><th>代码位置</th></tr></thead>
+<tbody>
+<tr><td><b>本地优先持久化</b></td><td>数据文件、任务状态、产物都在你电脑上（SQLite + 本地目录）</td><td><code>src/dataharness/storage/</code>、<code>providers/workspace/</code></td></tr>
+<tr><td><b>云端 LLM 驱动</b></td><td>大模型负责理解问题、规划、写代码、组织回答</td><td><code>src/dataharness/agent/</code>、<code>privacy/</code></td></tr>
+<tr><td><b>隔离执行</b></td><td>模型生成的代码只能在沙箱容器里跑，不能碰主机</td><td><code>src/dataharness/sandbox/</code>、<code>providers/sandbox/</code></td></tr>
+<tr><td><b>统一模型出口</b></td><td>所有发给云模型的内容必须经过 ModelGateway 的隐私检查</td><td><code>src/dataharness/privacy/gateway.py</code></td></tr>
+</tbody>
+</table>
+
+<h2>2. 它解决什么问题</h2>
+<p>
+想象你有一堆数据文件（销售报表、PDF 文档、Excel 表格），想让它帮你做分析。你可以直接把文件丢给大模型聊天——
+但这样有几个真实的问题，DataHarness 逐个解决：
+</p>
+<ul>
+<li><b>文件太多、上下文装不下</b> → 先建 <b>Project 库</b>，把文件版本化保存，用<b>全文检索（FTS5/BM25）</b>按需取片段（第 07 课）。</li>
+<li><b>模型写的代码有风险</b> → 代码只在<b>断网的沙箱容器</b>里执行，只读挂载你的文件（第 10 课）。</li>
+<li><b>任务跑一半崩溃了</b> → 所有状态写入 SQLite，Worker 用<b>租约（lease）</b>机制恢复未完成任务（第 11 课）。</li>
+<li><b>担心把密码、隐私数据发给模型</b> → <b>ModelGateway</b> 拦截凭据、把邮箱手机号替换成占位符（第 09 课）。</li>
+<li><b>模型胡说八道</b> → 最终结论必须绑定<b>可验证的证据</b>，过三道验证门（第 12 课）。</li>
+</ul>
+
+<h2>3. 系统架构总览</h2>
+<p>这是 <code>ARCHITECTURE.md</code> 第 4 节（<span class="cite">ARCHITECTURE.md:89-125</span>）的架构图，先混个眼熟，以后每课都会回来对照：</p>
+<div class="fig">
+<div class="diagram">用户 / 本地客户端（浏览器或 curl）
+        │ HTTP，仅 127.0.0.1:8000
+        ▼
+FastAPI（薄 API 层）──────────── api/
+        │
+        ├── ProjectService / TaskService / RunService ── orchestration/
+        │         └── Runtime SQLite ── 状态事实源
+        ├── ProjectCorpus ── LocalWorkspace + FTS5/BM25 ── projects/ + workspace/
+        ▼
+PydanticAI Agent（唯一的 Agent）── agent/
+   │  tools: search_project / execute_python / execute_sql / ...
+   ▼
+ModelGateway ────────▶ 云端 LLM API（secret 阻断 + PII 占位）
+   ▼
+AnalysisRuntime ──▶ OpenSandbox（断网 Docker 容器，只读挂载 Snapshot）
+                     └── 执行 LLM 生成的 Python/SQL，产出 Dataset/Artifact/Finding</div>
+<p class="caption">完整版见 ARCHITECTURE.md 第 4 节；模块依赖方向见第 5 节（api → orchestration → agent → domain + providers）。</p>
+</div>
+
+<h2>4. 目录结构：跟着这个清单读代码</h2>
+<p>包体在 <code>src/dataharness/</code> 下，模块即"分层"。对照 <span class="cite">ARCHITECTURE.md:139-197</span>：</p>
+<table>
+<thead><tr><th>目录</th><th>职责（一句话）</th><th>关键文件</th></tr></thead>
+<tbody>
+<tr><td><code>api/</code></td><td>HTTP 控制面：所有路由、错误映射、DTO</td><td><code>app.py</code>、<code>services.py</code></td></tr>
+<tr><td><code>config.py</code></td><td>读取 TOML 配置文件，Pydantic 校验</td><td><code>config.py</code></td></tr>
+<tr><td><code>domain/</code></td><td>纯领域模型：Project/Task/Run/Step/Finding…</td><td><code>project.py</code>、<code>task.py</code>、<code>run.py</code></td></tr>
+<tr><td><code>storage/</code></td><td>SQLite：迁移、仓储、事务、事件、队列</td><td><code>repository.py</code>、<code>store.py</code></td></tr>
+<tr><td><code>projects/</code></td><td>ProjectCorpus：文件导入、提取、检索、快照</td><td><code>corpus.py</code>、<code>extractors.py</code>、<code>index.py</code></td></tr>
+<tr><td><code>orchestration/</code></td><td>Task/Run 生命周期服务</td><td><code>services.py</code></td></tr>
+<tr><td><code>agent/</code></td><td>PydanticAI Agent 装配、工具、Runner</td><td><code>assembly.py</code>、<code>tools.py</code>、<code>handler.py</code></td></tr>
+<tr><td><code>privacy/</code></td><td>凭据/PII 检测、占位映射、模型网关</td><td><code>gateway.py</code>、<code>policy.py</code>、<code>detector.py</code></td></tr>
+<tr><td><code>sandbox/</code></td><td>沙箱协议与模型定义</td><td><code>protocols.py</code>、<code>models.py</code></td></tr>
+<tr><td><code>analysis/</code></td><td>分析执行、发布、验证门、血缘</td><td><code>runtime.py</code>、<code>verification.py</code></td></tr>
+<tr><td><code>workspace/</code></td><td>文件命名空间策略与发布桥</td><td><code>protocols.py</code>、<code>bridge.py</code></td></tr>
+<tr><td><code>providers/</code></td><td>第三方 SDK 适配：OpenSandbox、OpenAI、SQLite 工作区</td><td><code>sandbox/</code>、<code>model/</code>、<code>workspace/</code>、<code>durable/</code></td></tr>
+<tr><td><code>skills/</code></td><td>本地预装 Skill 的发现与激活</td><td><code>registry.py</code></td></tr>
+<tr><td><code>cli.py</code> / <code>launcher.py</code> / <code>worker.py</code></td><td>命令行、一键启动器、Worker 装配</td><td>—</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<strong>核心设计原则：分层依赖只朝一个方向</strong>
+<p>依赖方向是 <code>api → orchestration → agent/analysis/projects → domain + providers</code>（<span class="cite">ARCHITECTURE.md:128-137</span>）。
+<b>domain 层不 import FastAPI、不 import 任何 SDK、不做任何 I/O</b> —— 它只是纯数据结构 + 状态规则。
+这保证了核心逻辑可测试、可移植。后面第 05 课会看到为什么这么重要。</p>
+</div>
+
+<h2>5. 先跑起来看一眼</h2>
+<p>官方运行手册在 <code>README.md</code> 第 4–12 节。现在不需要理解细节，只需要知道有哪些入口（第 13 课会实操）：</p>
+<pre><code>uv sync --locked          # 安装依赖（uv.lock 是依赖事实源）
+Copy-Item .\dataharness.example.toml .\dataharness.local.toml   # 准备本地配置
+uv run dataharness check  # 校验配置
+uv run dataharness run    # 一键启动 Sandbox + API + Worker（前台）
+                          # 浏览器打开 http://127.0.0.1:8000</code></pre>
+<p>另外三个常用命令（<span class="cite">src/dataharness/cli.py:44-68</span>）：<code>dataharness serve</code>（只起 API）、<code>dataharness worker</code>（只起 Worker）、<code>dataharness --version</code>。</p>
+
+<h2>6. 本课练习</h2>
+<div class="practice">
+<strong>练习：验证你的地图</strong>
+<ol>
+<li>打开 <code>ARCHITECTURE.md</code>，找到第 4 节架构图，在图上把「浏览器 → FastAPI → Runtime SQLite → Agent → ModelGateway → OpenSandbox」这条链路描一遍。</li>
+<li>在 <code>src/dataharness/</code> 里找到这 5 个文件并各读第一行注释：<code>api/app.py</code>、<code>domain/__init__.py</code>、<code>privacy/gateway.py</code>、<code>providers/sandbox/opensandbox.py</code>、<code>analysis/runtime.py</code>。</li>
+<li>回答下面的小测验。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：谁负责执行 LLM 生成的代码？</h4>
+<div class="options">
+  <button class="option" data-correct="false">FastAPI 应用进程内直接 exec</button>
+  <button class="option" data-correct="true">隔离的 OpenSandbox 容器（断网、只读挂载）</button>
+  <button class="option" data-correct="false">模型提供商的服务器上</button>
+  <button class="option" data-correct="false">Runtime SQLite 里</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+项目最核心的安全承诺：<b>生成代码从未在 Host 执行</b>（<span class="cite">ARCHITECTURE.md:654</span>）。
+所有 Python/SQL 只交给 OpenSandbox 在 Docker 容器里执行（第 10 课详讲）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：项目状态（Task/Run/Step）的事实来源（source of truth）是？</h4>
+<div class="options">
+  <button class="option" data-correct="false">模型对话历史</button>
+  <button class="option" data-correct="false">沙箱内存</button>
+  <button class="option" data-correct="true">Runtime SQLite</button>
+  <button class="option" data-correct="false">浏览器 localStorage</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+设计原则 3.3「状态显式持久化」（<span class="cite">ARCHITECTURE.md:80-82</span>）：对话历史和沙箱内存都不是事实来源。
+这也是「API 重启、Host 崩溃都能恢复」的基础（第 11 课）。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 的第 1–5 节（产品定位、威胁模型、设计原则、总体架构、模块职责）。
+这是整个项目的事实基准，以后每课都会引用它。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>把问题直接问你的 AI 老师，例如：「domain 层为什么不能 import FastAPI？」「runtime-data 目录里的文件是谁创建的？」它可以结合代码给你讲透。</p>
+</div>
+
+<nav class="course-nav">
+  <span class="spacer"></span>
+  <a class="next" href="02-python-web-basics.html">下一课：Python 与 Web 基础</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 01 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

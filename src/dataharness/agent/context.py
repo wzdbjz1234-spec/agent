@@ -119,6 +119,8 @@ class ContextCheckpointManager:
         created_at: datetime | None = None,
         phase: RunPhase | None = None,
         run_lease_epoch: int | None = None,
+        sandbox_id: str | None = None,
+        sandbox_image_digest: str | None = None,
     ) -> CheckpointMetadata:
         """原子保存带哈希的 checkpoint，并记录 Runtime 元数据。"""
         sequence = self._next_sequence()
@@ -134,6 +136,8 @@ class ContextCheckpointManager:
             content_hash=resource.content_hash,
             created_at=created_at or utcnow(),
             project_snapshot_id=self.snapshot_id,
+            sandbox_id=sandbox_id,
+            sandbox_image_digest=sandbox_image_digest,
             run_lease_epoch=run_lease_epoch,
             phase=phase,
         )
@@ -198,6 +202,10 @@ class ContextCompactor:
         messages: tuple[ModelMessage, ...],
         *,
         created_at: datetime | None = None,
+        phase: RunPhase | None = None,
+        run_lease_epoch: int | None = None,
+        sandbox_id: str | None = None,
+        sandbox_image_digest: str | None = None,
     ) -> CompactedContext:
         """调用唯一模型边界生成摘要；summary 不会被转换成事实引用。"""
         messages_json = ModelMessagesTypeAdapter.dump_json(
@@ -218,7 +226,15 @@ class ContextCompactor:
         safe_summary = self._gateway.sanitize_compaction(self._manager.task_id, summary).cloud_text
         compacted_state = state.model_copy(update={"summary": safe_summary})
         compacted_messages = messages[-self._keep_messages :]
-        checkpoint = self._manager.save(compacted_state, compacted_messages, created_at=created_at)
+        checkpoint = self._manager.save(
+            compacted_state,
+            compacted_messages,
+            created_at=created_at,
+            phase=phase,
+            run_lease_epoch=run_lease_epoch,
+            sandbox_id=sandbox_id,
+            sandbox_image_digest=sandbox_image_digest,
+        )
         return CompactedContext(
             state=compacted_state,
             messages=compacted_messages,

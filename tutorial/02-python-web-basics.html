@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 Python 与 Web 基础 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 02 · 给零基础补的最小知识</div>
+  <h1>Python 与 Web 基础：读懂代码需要的最小知识</h1>
+  <p class="subtitle">本课只讲「看懂本仓库代码」必需的 Python 特性和 Web 概念。跳过你已会的部分即可。</p>
+</header>
+<main>
+
+<h2>1. 类型标注（Type Hints）</h2>
+<p>DataHarness 要求 Python ≥ 3.12（<span class="cite">pyproject.toml:5</span>），代码里大量使用类型标注。看一个真实例子 —— <code>api/services.py</code> 里方法的签名：</p>
+<pre><code># src/dataharness/api/services.py:148
+def get_project(self, project_id: str) -> Any:</code></pre>
+<p>含义：<code>project_id</code> 参数是 <code>str</code> 类型，返回值是 <code>Any</code>。类型标注<b>不影响运行</b>，它给人和工具（pyright/mypy）读。本仓库配置了 pyright 检查（<span class="cite">pyproject.toml:53-56</span>）。</p>
+<p>本仓库还会用到的标注语法：</p>
+<ul>
+<li><code>X | None</code> —— 可选值（Python 3.10+ 语法），等价于 <code>Optional[X]</code>。例：<code>model: str = "gpt-4o-mini"</code> 里 <code>api_key: str | None = None</code>（<span class="cite">config.py:58</span>）。</li>
+<li><code>tuple[X, ...]</code> —— 变长元组。例：<code>findings: tuple[Finding, ...]</code>（<span class="cite">api/models.py:63</span>）。</li>
+<li><code>Callable[[Run], SandboxSpec]</code> —— 函数类型（<span class="cite">orchestration/protocols.py:15</span>）。</li>
+</ul>
+
+<h2>2. Pydantic BaseModel：带校验的数据类</h2>
+<p>Pydantic 是本项目的建模基础（依赖声明在 <span class="cite">pyproject.toml:12</span>）。它做的事情：<b>声明字段 → 自动校验/转换 → 序列化成 JSON</b>。看 API 请求模型：</p>
+<pre><code># src/dataharness/api/models.py:14-17
+class CreateProjectRequest(BaseModel):
+    """创建 Project 的最小请求。"""
+    name: str = Field(min_length=1, max_length=255)</code></pre>
+<ul>
+<li>继承 <code>BaseModel</code> 后，字段自动获得校验：<code>name</code> 必须是 1–255 个字符的字符串。</li>
+<li>请求 JSON 不合法时，FastAPI 返回 422；Pydantic 的错误信息就是 <code>RequestValidationError</code> 的来源（第 03 课会看到它被映射成统一错误格式）。</li>
+</ul>
+<p>本项目所有模型几乎都带 <code>model_config = ConfigDict(frozen=True)</code>，例如：</p>
+<pre><code># src/dataharness/domain/project.py:43-48
+model_config = ConfigDict(frozen=True)
+id: ProjectId
+name: str
+status: ProjectStatus = ProjectStatus.ACTIVE</code></pre>
+<p><b>frozen=True 表示对象创建后不可修改</b>（与 dataclass 的 <code>frozen=True</code> 同理）。要"修改"就创建一个新对象（<code>model_copy(update=...)</code>）。第 05 课会专门讲这种设计的价值。</p>
+<p>另一种常见写法是 <code>@dataclass(frozen=True, slots=True)</code>，例如 <code>api/errors.py:8-14</code> 的 <code>ApiError</code> —— 与 Pydantic 的取舍：dataclass 更快、不校验；BaseModel 有校验和序列化能力。</p>
+
+<h2>3. async / await：并发的基础</h2>
+<p>Web 服务器要同时服务很多请求。Python 的方案是 <b>asyncio</b>：单线程内用「事件循环」调度协程。关键词只有三个：</p>
+<ul>
+<li><code>async def foo()</code> —— 定义一个<b>协程函数</b>；调用它不会立刻执行，而是返回一个可等待对象。</li>
+<li><code>await foo()</code> —— 暂停当前协程，等 foo 完成。等待期间事件循环可以跑别的协程。</li>
+<li><code>asyncio.run(main())</code> —— 创建事件循环并运行顶层协程。</li>
+</ul>
+<p>项目里的真实例子 —— FastAPI 路由是 async 的：</p>
+<pre><code># src/dataharness/api/app.py:134-136
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}</code></pre>
+<p>Worker 的循环也是 async（<span class="cite">providers/durable/executor.py:110-120</span>）：</p>
+<pre><code>async def run_worker(self, stop_event: asyncio.Event, *, idle_sleep_seconds: float = 0.1) -> None:
+    while not stop_event.is_set():
+        result = await self.run_once()
+        if result is None:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), idle_sleep_seconds)</code></pre>
+<p>注意：<b>阻塞调用（SQLite I/O、urllib 请求）不能直接放在 async 函数里</b>，否则会卡住整个事件循环。项目的做法是把同步调用包进线程：看 <code>agent/model.py:79</code> —— <code>await asyncio.to_thread(self._gateway.complete, ...)</code>，把耗时的模型请求放到线程里执行。</p>
+
+<div class="callout">
+<strong>项目用的另一个并发原语</strong>
+<p><code>threading.Thread</code> 也出现了 —— 在 <code>launcher.py:131-140</code>，启动器用线程把子进程（Sandbox/API/Worker）的日志输出转发到终端。asyncio 负责进程内的协程调度，subprocess 负责进程间，各司其职。</p>
+</div>
+
+<h2>4. HTTP 与 Web 服务器：请求是怎么变成代码执行的</h2>
+<p>Web 开发的核心心智模型，一张图讲完：</p>
+<div class="fig">
+<div class="diagram">你的浏览器 / curl
+   │  发送 HTTP 请求：方法(GET/POST) + URL(/projects) + 头(Header) + 体(Body)
+   ▼
+Web 服务器（uvicorn：解析 HTTP 协议，处理网络）       ← 本项目的 web 服务器
+   │  调用你的应用代码
+   ▼
+FastAPI 应用（路由匹配 → 校验参数 → 调用你的函数）     ← 本项目的应用框架
+   │
+   ▼
+返回 HTTP 响应：状态码(200/404/500) + JSON 体</div>
+<p class="caption">uvicorn 是 ASGI 服务器（<span class="cite">pyproject.toml:17</span>），FastAPI 是构建在它之上的框架（<span class="cite">pyproject.toml:16</span>）。</p>
+</div>
+<p>必须认识的状态码（本项目都会用到）：<code>200</code> 成功、<code>201</code> 创建成功、<code>400</code> 请求不合法、<code>404</code> 资源不存在、<code>422</code> 参数校验失败、<code>500</code> 服务器内部错误。</p>
+<p>本项目的完整路由表在 <span class="cite">ARCHITECTURE.md:567-589</span>（第 20 节）。例子：</p>
+<pre><code>POST /projects                     # 创建 Project
+POST /projects/{id}/files          # 导入文件（原始字节，文件名放 X-File-Name 头）
+POST /projects/{id}/tasks          # 创建分析任务
+GET  /tasks/{id}/events            # 任务事件
+GET  /tasks/{id}/answer            # 最终回答</code></pre>
+
+<h2>5. JSON：API 的通用语言</h2>
+<p>HTTP 响应体一般是 JSON。FastAPI + Pydantic 帮你自动完成「Python 对象 → JSON」和「JSON → Python 对象」。</p>
+<p>本项目有一个细节值得注意：所有路由都返回 <code>model_dump(mode="json")</code> 后的 dict，而不是依赖 FastAPI 的自动序列化（<span class="cite">api/app.py:88-95</span> 的错误处理就是手动构建 JSON）。因为 domain 对象含 <code>datetime</code> 等类型，<code>mode="json"</code> 会统一转成 ISO 字符串，保证格式可控。</p>
+
+<h2>6. 环境与依赖管理：uv + pyproject.toml</h2>
+<p>Python 项目的「配方」写在 <code>pyproject.toml</code>，依赖的<b>精确版本</b>锁定在 <code>uv.lock</code>。安装只用一条命令：</p>
+<pre><code>uv sync --locked    # 按 uv.lock 精确安装（--locked 表示不更新锁文件）</code></pre>
+<p>运行仓库里的命令：</p>
+<pre><code>uv run dataharness check    # 等价于：进入虚拟环境执行 dataharness 命令</code></pre>
+<p>命令入口的注册在 <code>pyproject.toml:21-22</code>：</p>
+<pre><code>[project.scripts]
+dataharness = "dataharness.cli:main"</code></pre>
+<p>意思是：执行 <code>dataharness</code> 就等于调用 <code>cli.py</code> 里的 <code>main</code> 函数。第 04 课会解剖这个函数的内部。</p>
+
+<h2>7. 本课练习</h2>
+<div class="practice">
+<strong>练习：在代码里找语法</strong>
+<ol>
+<li>打开 <code>src/dataharness/config.py</code>，找出 <code>str | None</code>、<code>Field(default=..., repr=False)</code>、<code>@model_validator</code> 各一处，说说它在这里的作用。</li>
+<li>打开 <code>src/dataharness/domain/task.py</code>，数一数有多少个 <code>model_copy(update=...)</code> 调用 —— 它们都是"修改"状态的方式。</li>
+<li>打开 <code>src/dataharness/api/app.py</code>，找到全部 3 个 async 中间件/路由，注意它们的 <code>await call_next(request)</code>（中间件）和直接返回 dict（路由）。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：frozen=True 的 Pydantic 模型如何"修改"？</h4>
+<div class="options">
+  <button class="option" data-correct="false">直接给字段赋值（obj.name = "x"）</button>
+  <button class="option" data-correct="false">把 frozen 删掉</button>
+  <button class="option" data-correct="true">用 model_copy(update=...) 创建新实例</button>
+  <button class="option" data-correct="false">调用模型的方法即可原地改</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+frozen 模型赋值会抛 <code>ValidationError</code>。所有状态变更都返回新实例，例如 <code>task.py</code> 里的 <code>start()</code>/<code>complete()</code>（第 05 课详讲）。这保证了「旧状态对象永远有效」，是并发安全的基础。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：uvicorn 和 FastAPI 的关系是？</h4>
+<div class="options">
+  <button class="option" data-correct="true">uvicorn 是 ASGI 服务器，FastAPI 是应用框架，FastAPI 跑在 uvicorn 上</button>
+  <button class="option" data-correct="false">两者是同一个东西的两种叫法</button>
+  <button class="option" data-correct="false">FastAPI 是服务器，uvicorn 是框架</button>
+  <button class="option" data-correct="false">它们没有关系，二选一即可</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+分层：uvicorn 处理 TCP/HTTP 协议，把请求交给 FastAPI 应用；FastAPI 负责路由匹配、参数校验、调用你的函数。启动命令 <code>uvicorn.run(create_app(...))</code>（<span class="cite">cli.py:108-119</span>）就是「把应用交给服务器」。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p>Python 官方教程的 <a href="https://docs.python.org/3/tutorial/">「Classes」和「Coroutines and Tasks」</a> 两章；
+Pydantic 官方文档的 <a href="https://docs.pydantic.dev/latest/concepts/models/">「Models」一章</a>（重点是 <code>model_config</code> 与校验器）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「为什么 async 函数里不能直接调 SQLite？」「<code>Any</code> 和 <code>object</code> 有什么区别？」它可以用仓库代码举例解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="01-project-overview.html">上一课：项目概览</a>
+  <a class="next" href="03-fastapi-api-layer.html">下一课：FastAPI 入门</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 02 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

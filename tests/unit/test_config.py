@@ -30,12 +30,16 @@ def test_sandbox_network_cannot_be_enabled() -> None:
 def test_load_settings_from_toml_overrides_and_falls_back(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(
-        '[model]\nprovider = "anthropic"\nmodel = "claude-3"\n[budget]\nmax_analysis_steps = 10\n',
+        (
+            '[model]\nprovider = "anthropic"\nmodel = "claude-3"\n'
+            'api_key = "synthetic-key"\n[budget]\nmax_analysis_steps = 10\n'
+        ),
         encoding="utf-8",
     )
     settings = load_settings(config)
     assert settings.model.provider == "anthropic"
     assert settings.model.model == "claude-3"
+    assert settings.model.api_key == "synthetic-key"
     assert settings.budget.max_analysis_steps == 10
     # 未覆盖字段使用默认值
     assert settings.sandbox.network_enabled is False

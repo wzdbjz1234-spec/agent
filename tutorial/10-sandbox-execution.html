@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 沙箱执行 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 10 · 安全边界的核心</div>
+  <h1>沙箱：LLM 生成的代码在哪里执行</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/sandbox/</code> 与 <code>providers/sandbox/</code>：为什么需要沙箱、OpenSandbox 如何被接入、attestation 探测与 digest 锁定如何保证「配置了才算数」。</p>
+</header>
+<main>
+
+<h2>1. 为什么必须有沙箱</h2>
+<p>项目最基本的威胁假设（<span class="cite">ARCHITECTURE.md:22-24</span>）：</p>
+<ul>
+<li><b>LLM 生成的代码视为不可信输入</b> —— 它可能读文件、删文件、外传数据、跑死机器。</li>
+<li>Host（你的电脑）绝不能直接执行它：<b>禁止 exec/eval/import 任何生成代码</b>（<span class="cite">ARCHITECTURE.md:78</span>）。</li>
+</ul>
+<p>所以代码只能进隔离容器。项目用 <a href="https://github.com/opensandbox-group/OpenSandbox">OpenSandbox</a> 平台 —— 它负责创建、资源限制、进程隔离，DataHarness 负责「用制度约束它」：把 spec 写死、创建后核验、不符就失败。</p>
+<div class="diagram">Host（可信）                          沙箱（不可信）
+FastAPI / Worker                        secure-analysis 容器（Docker）
+  │                                        │
+  └── SandboxProvider 协议 ────────────────┤
+        create / connect / execute /       ├── /project       只读（Snapshot 文件）
+        cancel / terminate                 ├── /task/working  可写（Task 中间数据）
+                                           └── /task/staging  可写（待发布输出）
+                                          默认断网 · 非 root · 资源受限</div>
+
+<h2>2. 协议：业务层只看接口</h2>
+<p>业务代码只依赖 <code>SandboxProvider</code> 协议（<span class="cite">sandbox/protocols.py:10-31</span>）：</p>
+<pre><code>class SandboxProvider(Protocol):
+    """Run-scoped Sandbox 生命周期；不提供 Host shell、装包或网络开关。"""
+    async def create(self, spec: SandboxSpec) -> SandboxLease: ...
+    async def connect(self, sandbox_id: str) -> SandboxLease: ...
+    async def execute(self, lease: SandboxLease, request: ExecutionRequest) -> ExecutionResult: ...
+    async def cancel(self, lease: SandboxLease, step_id: str) -> None: ...
+    async def terminate(self, lease: SandboxLease) -> None: ...</code></pre>
+<p>协议上没有「装包」「开网络」「跑任意命令」—— 接口形状本身就限制了能力。实现有两个：<code>OpenSandboxProvider</code>（生产）和 <code>FakeSandboxProvider</code>（测试，不执行任何代码，<span class="cite">providers/sandbox/fake.py:33-117</span>）。</p>
+
+<h2>3. SandboxSpec：安全契约在构造时就锁死</h2>
+<p><code>sandbox/models.py:86-114</code> 的校验器 —— 不满足安全要求的 spec 在<b>调用 Provider 之前</b>就构造失败：</p>
+<pre><code>@model_validator(mode="after")
+def _validate_security_contract(self) -> SandboxSpec:
+    """安全策略不接受开发期宽松值；不符的规格在调用 Provider 前直接失败。"""
+    if self.runtime != "secure-analysis":
+        raise ValueError("V1 仅允许 secure-analysis 运行时")
+    if not _DIGEST.fullmatch(self.image_digest):          # sha256:64位hex
+        raise ValueError("镜像必须使用锁定的 sha256 digest")
+    if (self.network_enabled or self.privileged or not self.root_read_only
+            or self.user != "sandbox"):
+        raise ValueError("Sandbox 必须断网、非特权、只读根且使用 sandbox 用户")
+    mounts = {item.target: item for item in self.mounts}
+    if set(mounts) != {"/project", "/task/working", "/task/staging"}:
+        raise ValueError("必须且只能挂载 project、working 和 staging 三个受控目录")
+    ...</code></pre>
+<p>逐条翻译：</p>
+<ul>
+<li><b>运行时写死</b>：只能是 <code>secure-analysis</code>；</li>
+<li><b>镜像 digest 锁定</b>：格式必须是 <code>sha256:</code> + 64 位十六进制（<span class="cite">models.py:13</span>）—— 不允许 <code>latest</code> 标签，Docker 无法把未锁定的引用解析成可变镜像（<span class="cite">ARCHITECTURE.md:321</span>）；</li>
+<li><b>三不</b>：不断网不行（网络开关、特权模式、非只读根、非 sandbox 用户一律拒绝）；</li>
+<li><b>挂载精确匹配</b>：必须且只能挂载 <code>/project</code>（只读）、<code>/task/working</code>、<code>/task/staging</code>，且 source 引用必须精确绑定当前 Run 的快照与 Task。</li>
+</ul>
+<p>生产 spec 的构造在 <code>worker.py:72-113</code>（<code>_sandbox_factory</code>）：</p>
+<pre><code>SandboxMount(source_ref=f"snapshot:{run.project_snapshot_id}", target="/project", read_only=True),
+SandboxMount(source_ref=f"task:{run.task_id}:working", target="/task/working", read_only=False),
+SandboxMount(source_ref=f"task:{run.task_id}:staging", target="/task/staging", read_only=False),</code></pre>
+<p>「snapshot:xxx」「task:xxx:working」是<b>资源引用</b>而不是主机路径 —— 主机路径只存在于 Worker 的 mount resolver（<span class="cite">worker.py:34-69</span>），并且解析后必须仍在 Workspace 根目录内（<span class="cite">worker.py:64-68</span>）。</p>
+
+<h2>4. 创建后必须核验：attestation</h2>
+<p>光在 spec 里写死没用 —— 谁知道容器实际跑起来是不是那个样子？所以 <code>OpenSandboxProvider.create</code>（<span class="cite">providers/sandbox/opensandbox.py:98-113</span>）创建后立刻做<b>运行时探测</b>，失败就销毁：</p>
+<pre><code>async def create(self, spec: SandboxSpec) -> SandboxLease:
+    """创建后立即认证；认证失败时尽力销毁，绝不保留宽松 lease。"""
+    sandbox_id = await self._client.create_sandbox(spec)
+    try:
+        await self._attest(sandbox_id, spec)      # 探测实际配置
+    except Exception:
+        await self._client.terminate_sandbox(sandbox_id)   # 不符 → 销毁
+        raise
+    lease = self._lease(sandbox_id, spec)
+    self._leases[sandbox_id] = _LeaseState(lease, spec)</code></pre>
+<p>探测脚本在 <code>opensandbox_sdk.py:59-123</code>（<code>_PROBE_SCRIPT</code>），在容器<b>内部</b>运行，检查：运行用户/UID、NoNewPrivs、CapEff=0、根目录可写性、出站网络连通性、三个挂载的存在与读写性、cgroup 内存上限。每一项与 spec 不符都 fail closed（<span class="cite">opensandbox_sdk.py:321-350</span>）。</p>
+<p>对比函数 <code>_matches</code>（<span class="cite">opensandbox.py:64-75</span>）：<b>实际与预期逐字段相等</b>，多一个挂载、少一个挂载都不行。失败是唯一的出口 —— 「宁可沙箱不可用，绝不静默降级」。</p>
+
+<h2>5. 执行：每步独立进程</h2>
+<p><code>execute</code>（<span class="cite">opensandbox.py:138-169</span>）的几个细节：</p>
+<ul>
+<li>同一沙箱不能并发执行同一 Step（防止重复副作用，<span class="cite">opensandbox.py:146-149</span>）；</li>
+<li>输出大小超限 → <code>SandboxOutputLimitError</code>（<span class="cite">opensandbox.py:156-158</span>）；</li>
+<li><code>finally</code> 里<b>必须</b> <code>cleanup_step</code>：清残留进程；清不掉则整个 lease 作废（<span class="cite">opensandbox.py:165-169</span>）。</li>
+</ul>
+<p>执行细节在 <code>opensandbox_sdk.py:354-433</code>：代码写入 <code>/task/working/{step_id}.py</code>，作为独立进程运行，支持取消事件；SQL 走镜像内固定脚本 <code>dataharness-sql-runner.py</code>。</p>
+<div class="callout">
+<strong>为什么「每步独立进程」这么重要</strong>
+<p>因为没有持久 REPL（<span class="cite">ARCHITECTURE.md:296-298</span>）：Step 之间不能依赖 Python 变量或后台进程 —— 每步从零开始，结果只能通过文件（staging）传递。这消灭了「上一步的副作用影响下一步」的隐式状态。</p>
+</div>
+
+<h2>6. 挂载解析：白名单 + 路径校验</h2>
+<p>资源引用 → 主机路径的解析在 <code>worker.py:34-69</code>（<code>_mount_resolver</code>）：</p>
+<ul>
+<li>白名单只有三种引用：<code>snapshot:{id}</code>、<code>task:{id}:working</code>、<code>task:{id}:staging</code>；</li>
+<li>其他一律 <code>PolicyDeniedError</code>；</li>
+<li>解析后的路径必须仍在 Workspace 根内、存在且是目录（<span class="cite">worker.py:64-68</span>）。</li>
+</ul>
+<p>所以即使沙箱有漏洞想读主机文件，它也没有路径可读 —— 它只知道三个挂载点。</p>
+
+<h2>7. 镜像怎么来的：构建与锁定</h2>
+<p>镜像在 <code>sandbox-images/secure-analysis/</code>：<code>build.bat</code> 拒绝未锁定的基础镜像、安装 <code>requirements.lock</code> 依赖、删除运行期 pip 和缓存、创建非 root <code>sandbox</code> 用户（uid 10001）、写入 <code>build-evidence/image-digest.txt</code>（<span class="cite">README.md:138-151</span>）。配置里的 <code>[sandbox].image_digest</code> 必须与它一致。发布前的 <code>release_check.py --require-image</code> 会核验证据（<span class="cite">README.md:161-165</span>）。</p>
+
+<h2>8. 练习</h2>
+<div class="practice">
+<strong>练习：读安全契约</strong>
+<ol>
+<li>打开 <code>sandbox/models.py</code>，把 <code>_validate_security_contract</code> 的每个 if 写进一张表：「条件 / 拒绝的威胁」。</li>
+<li>打开 <code>providers/sandbox/opensandbox.py</code> 的 <code>_attest</code> 与 <code>_matches</code>，说出 attestation 与 spec 校验的分工（谁防「配置错误」，谁防「实际不符」）。</li>
+<li>打开 <code>worker.py</code> 的 <code>_mount_resolver</code>（34-69 行），试着自己构造一个恶意引用（如 <code>../runtime.db</code> 或 <code>/etc/passwd</code>），看它会被哪一行代码拒绝。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：镜像引用为什么必须是 sha256 digest 而不能是 latest？</h4>
+<div class="options">
+  <button class="option" data-correct="false">digest 格式更快</button>
+  <button class="option" data-correct="true">latest 是可变标签，镜像内容可以悄悄变化；digest 锁定内容不可变</button>
+  <button class="option" data-correct="false">Docker 不支持 latest</button>
+  <button class="option" data-correct="false">digest 更省磁盘</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>latest</code> 指向的内容会随推送变化 —— 你今天验证安全的镜像明天可能被替换成别的。<code>name@sha256:…</code> 锁定的是内容本身（<span class="cite">ARCHITECTURE.md:321-322</span>）。创建时 docker daemon 对 digest 引用的解析强制这一约束。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：attestation 探测在什么时候执行？</h4>
+<div class="options">
+  <button class="option" data-correct="false">只在测试环境</button>
+  <button class="option" data-correct="false">只在沙箱第一次启动时，之后永远信任</button>
+  <button class="option" data-correct="true">每次 create 之后、每次 connect 重连时都重新核验</button>
+  <button class="option" data-correct="false">从不执行，只看 spec</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+create 后立即 attest（<span class="cite">opensandbox.py:98-113</span>），connect 重连时也重新 attest（<span class="cite">opensandbox.py:115-121</span>）—— 崩溃恢复后重连的沙箱必须仍是原来那个配置。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 8 节「Sandbox 与代码执行」（<span class="cite">ARCHITECTURE.md:275-333</span>），
+和 <a href="https://github.com/opensandbox-group/OpenSandbox">OpenSandbox 官方仓库</a> 的 README（理解平台本身的能力与限制）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「CapEff=0 是什么？」「为什么用非 root 用户 + no_new_privileges 而不是只读根挂载？」它可以结合代码和容器知识解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="09-model-gateway-privacy.html">上一课：模型网关与隐私</a>
+  <a class="next" href="11-durable-execution.html">下一课：耐久编排</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 10 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

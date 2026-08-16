@@ -1,20 +1,21 @@
 # DataHarness 示例配置（TOML）。
 # 复制并修改后通过 `dataharness check --config <path>` 校验。
-# 注意：不在此处填写任何真实 API 密钥；密钥经环境变量注入。
+# 注意：不在此处填写任何真实 API 密钥；请复制为 dataharness.local.toml 后再填写。
 
 [paths]
 # 本地运行数据根目录；projects/ 与 privacy/ 缺省派生自该根
 runtime_data_root = "runtime-data"
 
 [model]
-provider = "openai"
-model = "gpt-4o-mini"
-# 仅记录环境变量名，运行时从环境读取实际密钥
-api_key_env = "DATAHARNESS_MODEL_API_KEY"
+provider = "deepseek"
+model = "deepseek-v4-flash"
+# 仅本地 dataharness.local.toml 填写真实 API Key；不要提交该文件。
+api_key = ""
 timeout_seconds = 120.0
+base_url = "https://api.deepseek.com"
 
 [sandbox]
-endpoint = "http://127.0.0.1:8080"
+endpoint = "http://127.0.0.1:18080"
 runtime = "secure-analysis"
 # 生产环境必须锁定镜像 digest（如 "sha256:..."）；此处省略表示待锁定
 network_enabled = false

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timedelta
@@ -24,7 +25,9 @@ from dataharness.orchestration.protocols import (
     RunHandler,
     SandboxSpecFactory,
 )
+from dataharness.privacy import ModelProviderError
 from dataharness.sandbox import (
+    SandboxError,
     SandboxLease,
     SandboxLostError,
     SandboxPolicyError,
@@ -32,6 +35,8 @@ from dataharness.sandbox import (
 )
 from dataharness.storage import CheckpointMetadata, ClaimedRun, LeaseLostError, SqliteRuntimeStore
 from dataharness.workspace import VirtualWorkspace
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class LocalDurableExecutor:
@@ -57,6 +62,7 @@ class LocalDurableExecutor:
         sandbox_spec_factory: SandboxSpecFactory | None = None,
         workspace: VirtualWorkspace | None = None,
         cancel_grace_seconds: float = 0.25,
+        on_run_state: Callable[[Run | None], None] | None = None,
     ) -> None:
         if not owner.strip():
             raise ValueError("worker owner 不能为空")
@@ -77,13 +83,29 @@ class LocalDurableExecutor:
         self._sandbox_spec_factory = sandbox_spec_factory
         self._workspace = workspace
         self._cancel_grace_seconds = cancel_grace_seconds
+        # Worker 监督器只接收当前 Run 的稳定 ID，不接收 prompt、模型消息或 Sandbox
+        # 载荷。回调异常不能改变耐久执行语义，因此通知统一在安全边界内吞掉。
+        self._on_run_state = on_run_state
 
     async def run_once(self) -> Run | None:
         """领取并执行一个 Run；队列为空返回 None。"""
         claimed = self._store.claim_next_run(self._owner, self._clock(), self._lease_duration)
         if claimed is None:
             return None
-        return await self._execute_claim(claimed)
+        self._notify_run_state(claimed.run)
+        try:
+            return await self._execute_claim(claimed)
+        finally:
+            # 无论成功、失败、取消还是 lease 丢失，都必须清除“当前执行”标记，
+            # 这样 stop.ps1 才能区分正在 drain 的 Worker 与已经安全空闲的 Worker。
+            self._notify_run_state(None)
+
+    def _notify_run_state(self, run: Run | None) -> None:
+        """向本机监督器报告当前 Run；只传递稳定标识，不传递业务正文。"""
+        if self._on_run_state is None:
+            return
+        with suppress(Exception):
+            self._on_run_state(run)
 
     async def run_worker(
         self, stop_event: asyncio.Event, *, idle_sleep_seconds: float = 0.1
@@ -106,7 +128,22 @@ class LocalDurableExecutor:
 
         sandbox_lease: SandboxLease | None = None
         try:
-            sandbox_lease, decision = await self._restore_sandbox(run, checkpoint, decision)
+            # AgentRunHandler 可以声明自己支持按需 Sandbox；测试 fake 没有这个可选
+            # seam 时默认保持旧行为，确保未知 handler 仍然在隔离环境中执行。
+            requires_sandbox = getattr(self._handler, "requires_sandbox", None)
+            needs_sandbox = bool(requires_sandbox(run)) if callable(requires_sandbox) else True
+            if needs_sandbox:
+                sandbox_lease, decision = await self._restore_sandbox(run, checkpoint, decision)
+
+            async def acquire_sandbox() -> SandboxLease:
+                """只在执行工具首次调用时创建/恢复 Sandbox。"""
+                nonlocal sandbox_lease, decision
+                if sandbox_lease is None:
+                    sandbox_lease, decision = await self._restore_sandbox(run, checkpoint, decision)
+                if sandbox_lease is None:
+                    raise SandboxError("当前 Run 未配置可用的 Sandbox")
+                return sandbox_lease
+
             context = RunExecutionContext(
                 run,
                 worker_owner=self._owner,
@@ -115,6 +152,7 @@ class LocalDurableExecutor:
                 recovery_decision=decision,
                 checkpoint_ref=checkpoint.checkpoint_ref if checkpoint else None,
                 sandbox_lease=sandbox_lease,
+                sandbox_factory=acquire_sandbox,
                 now=self._clock(),
             )
             outcome = await self._handler(context)
@@ -262,6 +300,8 @@ class LocalDurableExecutor:
                 self._workspace.cleanup_staging(result.project_id, result.task_id)
         elif result.status == RunStatus.SUCCEEDED:
             self._complete_task(result)
+        elif outcome.decision == ExecutionDecision.WAITING:
+            self._wait_task(result, outcome.wait_reason or WaitReason.USER_INPUT)
         return result
 
     def _validate_checkpoint(
@@ -278,6 +318,7 @@ class LocalDurableExecutor:
     async def _handle_failure(
         self, claimed: ClaimedRun, error: BaseException, sandbox_lease: SandboxLease | None
     ) -> Run:
+        root_error = error
         failure_class, retryable = classify_error(error)
         await self._terminate_sandbox(sandbox_lease)
         if failure_class == FailureClass.BUDGET_EXHAUSTED:
@@ -296,25 +337,56 @@ class LocalDurableExecutor:
             return self._get_run(claimed.run.id)
         if retryable and attempts >= self._max_retries:
             error = RetryLimitExceeded(f"Run 自动重试达到上限：{self._max_retries}")
-        return self._fail_claim(claimed, error, failure_class)
+        return self._fail_claim(claimed, error, failure_class, cause=root_error)
 
     def _wait_for_budget(self, claimed: ClaimedRun) -> Run:
         now = self._clock()
         with self._store.unit_of_work(immediate=True) as uow:
             stored = uow.repo.get_run(claimed.run.id)
             updated = stored.value.wait(WaitReason.BUDGET_EXHAUSTED, now)
-            return uow.repo.save_run(
+            result = uow.repo.save_run(
                 updated,
                 stored.version,
                 "RUN_WAITING_BUDGET",
                 lease=claimed.lease,
                 lease_checked_at=now,
             ).value
+        self._wait_task(result, WaitReason.BUDGET_EXHAUSTED)
+        return result
 
     def _fail_claim(
-        self, claimed: ClaimedRun, error: BaseException, failure_class: FailureClass
+        self,
+        claimed: ClaimedRun,
+        error: BaseException,
+        failure_class: FailureClass,
+        *,
+        cause: BaseException | None = None,
     ) -> Run:
         now = self._clock()
+        # 失败事件只写稳定分类和 Provider 错误代码；绝不写异常正文、prompt、模型响应
+        # 或第三方 SDK 路径，既让 WebUI 能显示可操作诊断，也保持 Runtime 事件脱敏边界。
+        failure_metadata: dict[str, object] = {"failure_class": failure_class.value}
+        if isinstance(error, ModelProviderError):
+            failure_metadata["error_code"] = error.code
+        else:
+            failure_metadata["error_type"] = type(error).__name__
+        if cause is not None and cause is not error:
+            if isinstance(cause, ModelProviderError):
+                failure_metadata["cause_code"] = cause.code
+            else:
+                failure_metadata["cause_type"] = type(cause).__name__
+        # 受管前台 Supervisor 会把 Worker stderr 转发到当前窗口；日志只输出上面
+        # 已经收窄过的分类字段，让用户能定位失败阶段而不会泄露异常正文或业务内容。
+        _LOGGER.error(
+            "Run failed: run_id=%s failure_class=%s error_code=%s error_type=%s "
+            "cause_code=%s cause_type=%s",
+            claimed.run.id,
+            failure_metadata.get("failure_class", ""),
+            failure_metadata.get("error_code", ""),
+            failure_metadata.get("error_type", ""),
+            failure_metadata.get("cause_code", ""),
+            failure_metadata.get("cause_type", ""),
+        )
         with self._store.unit_of_work(immediate=True) as uow:
             stored = uow.repo.get_run(claimed.run.id)
             updated = stored.value.fail(now)
@@ -325,6 +397,13 @@ class LocalDurableExecutor:
                 lease=claimed.lease,
                 lease_checked_at=now,
             ).value
+            uow.repo.append_event(
+                "run",
+                str(claimed.run.id),
+                "RUN_FAILURE_DIAGNOSIS",
+                now,
+                failure_metadata,
+            )
         self._fail_task(result, failure_class)
         return result
 
@@ -382,3 +461,11 @@ class LocalDurableExecutor:
             stored = uow.repo.get_task(run.task_id)
             if stored.value.status in (TaskStatus.QUEUED, TaskStatus.ACTIVE):
                 uow.repo.save_task(stored.value.cancel(now), stored.version, "TASK_CANCELLED")
+
+    def _wait_task(self, run: Run, reason: WaitReason) -> None:
+        """Run 进入 WAITING 时同步推进 Task，保证 API resume 看到同一生命周期事实。"""
+        now = self._clock()
+        with self._store.unit_of_work(immediate=True) as uow:
+            stored = uow.repo.get_task(run.task_id)
+            if stored.value.status == TaskStatus.ACTIVE:
+                uow.repo.save_task(stored.value.wait(reason, now), stored.version, "TASK_WAITING")

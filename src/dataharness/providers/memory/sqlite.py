@@ -10,7 +10,15 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from dataharness.domain import ContentHash, ResourceRef, RunId, TaskId, compute_content_hash
+from dataharness.domain import (
+    ContentHash,
+    ProjectId,
+    ResourceRef,
+    RunId,
+    SessionId,
+    TaskId,
+    compute_content_hash,
+)
 
 
 class HistoryEntry(BaseModel):
@@ -25,6 +33,8 @@ class HistoryEntry(BaseModel):
     content_hash: ContentHash
     references: tuple[ResourceRef, ...] = ()
     created_at: datetime
+    project_id: ProjectId | None = None
+    session_id: SessionId | None = None
 
 
 class HistoryHit(BaseModel):
@@ -44,12 +54,21 @@ class HistoryStore(Protocol):
         *,
         task_id: TaskId,
         run_id: RunId,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
         text: str,
         references: tuple[ResourceRef, ...] = (),
         created_at: datetime,
     ) -> HistoryEntry: ...
 
-    def search(self, query: str, *, limit: int = 20) -> tuple[HistoryHit, ...]: ...
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
+    ) -> tuple[HistoryHit, ...]: ...
 
 
 class SqliteHistoryStore:
@@ -65,6 +84,8 @@ class SqliteHistoryStore:
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL,
                     run_id TEXT NOT NULL,
+                    project_id TEXT,
+                    session_id TEXT,
                     text TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     references_json TEXT NOT NULL,
@@ -74,6 +95,14 @@ class SqliteHistoryStore:
                 USING fts5(entry_id UNINDEXED, content, tokenize='unicode61');
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(history_entries)").fetchall()
+            }
+            if "project_id" not in columns:
+                connection.execute("ALTER TABLE history_entries ADD COLUMN project_id TEXT")
+            if "session_id" not in columns:
+                connection.execute("ALTER TABLE history_entries ADD COLUMN session_id TEXT")
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path)
@@ -89,6 +118,8 @@ class SqliteHistoryStore:
             id=row["id"],
             task_id=TaskId(row["task_id"]),
             run_id=RunId(row["run_id"]),
+            project_id=ProjectId(row["project_id"]) if row["project_id"] else None,
+            session_id=SessionId(row["session_id"]) if row["session_id"] else None,
             text=row["text"],
             content_hash=ContentHash(row["content_hash"]),
             references=references,
@@ -100,6 +131,8 @@ class SqliteHistoryStore:
         *,
         task_id: TaskId,
         run_id: RunId,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
         text: str,
         references: tuple[ResourceRef, ...] = (),
         created_at: datetime,
@@ -112,6 +145,8 @@ class SqliteHistoryStore:
             id=entry_id,
             task_id=task_id,
             run_id=run_id,
+            project_id=project_id,
+            session_id=session_id,
             text=text,
             content_hash=compute_content_hash(text.encode("utf-8")),
             references=references,
@@ -125,12 +160,15 @@ class SqliteHistoryStore:
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO history_entries "
-                "(id, task_id, run_id, text, content_hash, references_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(id, task_id, run_id, project_id, session_id, text, content_hash, "
+                "references_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     entry.id,
                     str(task_id),
                     str(run_id),
+                    str(project_id) if project_id else None,
+                    str(session_id) if session_id else None,
                     entry.text,
                     str(entry.content_hash),
                     payload,
@@ -143,28 +181,47 @@ class SqliteHistoryStore:
             )
         return entry
 
-    def search(self, query: str, *, limit: int = 20) -> tuple[HistoryHit, ...]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
+    ) -> tuple[HistoryHit, ...]:
         """按 FTS5 BM25 排序检索历史；查询语法错误时按普通短语重试。"""
         if not query.strip():
             return ()
         if not 0 < limit <= 100:
             raise ValueError("历史检索 limit 必须在 1 到 100 之间")
         match_query = query.strip()
+        scope_sql = ""
+        scope_params: list[object] = []
+        if project_id is not None:
+            scope_sql += " AND e.project_id = ?"
+            scope_params.append(str(project_id))
+        if session_id is not None:
+            scope_sql += " AND e.session_id = ?"
+            scope_params.append(str(session_id))
         with self._connect() as connection:
             try:
                 rows = connection.execute(
                     "SELECT e.*, bm25(history_fts) AS score "
                     "FROM history_fts JOIN history_entries e ON e.id = history_fts.entry_id "
-                    "WHERE history_fts MATCH ? ORDER BY score, e.created_at DESC LIMIT ?",
-                    (match_query, limit),
+                    "WHERE history_fts MATCH ?"
+                    + scope_sql
+                    + " ORDER BY score, e.created_at DESC LIMIT ?",
+                    (match_query, *scope_params, limit),
                 ).fetchall()
             except sqlite3.OperationalError:
                 phrase = '"' + match_query.replace('"', '""') + '"'
                 rows = connection.execute(
                     "SELECT e.*, bm25(history_fts) AS score "
                     "FROM history_fts JOIN history_entries e ON e.id = history_fts.entry_id "
-                    "WHERE history_fts MATCH ? ORDER BY score, e.created_at DESC LIMIT ?",
-                    (phrase, limit),
+                    "WHERE history_fts MATCH ?"
+                    + scope_sql
+                    + " ORDER BY score, e.created_at DESC LIMIT ?",
+                    (phrase, *scope_params, limit),
                 ).fetchall()
         return tuple(
             HistoryHit(entry=self._entry_from_row(row), score=float(row["score"])) for row in rows

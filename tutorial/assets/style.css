@@ -1,0 +1,158 @@
+/* DataHarness 教程共享样式 —— 所有课程页面共用。设计取向：Tufte 风格、可打印、长文友好。 */
+
+:root {
+  --ink: #1a1a1a;
+  --paper: #ffffff;
+  --muted: #666;
+  --rule: #ddd;
+  --accent: #b45309;
+  --accent-soft: #fdf6ec;
+  --code-bg: #f6f6f4;
+  --code-ink: #24292f;
+  --ok: #166534;
+  --ok-bg: #f0fdf4;
+  --bad: #991b1b;
+  --bad-bg: #fef2f2;
+}
+
+* { box-sizing: border-box; }
+
+html { font-size: 17px; }
+
+body {
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Songti SC", "Noto Serif SC", serif;
+  color: var(--ink);
+  background: var(--paper);
+  line-height: 1.65;
+  margin: 0;
+  padding: 0 1.25rem 4rem;
+}
+
+main, header.site, footer.site, nav.course-nav {
+  max-width: 46rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+header.site { border-bottom: 1px solid var(--rule); padding: 2.5rem 0 1.25rem; }
+header.site .kicker { color: var(--muted); font-size: 0.85rem; letter-spacing: 0.08em; text-transform: uppercase; }
+header.site h1 { font-size: 1.9rem; line-height: 1.25; margin: 0.35rem 0 0.5rem; }
+header.site .subtitle { color: var(--muted); margin: 0; font-size: 1rem; }
+
+h2 { font-size: 1.35rem; margin-top: 2.6rem; border-bottom: 1px solid var(--rule); padding-bottom: 0.25rem; }
+h3 { font-size: 1.12rem; margin-top: 2rem; }
+h4 { font-size: 1rem; margin-top: 1.5rem; }
+
+p, li { line-height: 1.7; }
+a { color: var(--accent); text-decoration-color: rgba(180, 83, 9, 0.4); }
+a:hover { text-decoration-thickness: 2px; }
+code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.85em; background: var(--code-bg); border-radius: 3px; padding: 0.1em 0.35em; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+pre code { background: none; padding: 0; font-size: 1em; }
+blockquote {
+  margin: 1.5rem 0;
+  padding: 0.6rem 1.2rem;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  font-style: italic;
+}
+blockquote p { margin: 0.35rem 0; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.5rem 0; }
+
+.cite {
+  color: var(--muted);
+  font-size: 0.82rem;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0.1em 0.45em;
+  white-space: nowrap;
+}
+sup .cite { white-space: normal; }
+
+.fig { margin: 1.75rem 0; }
+.fig pre { background: #fff; }
+.fig .caption { color: var(--muted); font-size: 0.85rem; margin-top: 0.4rem; text-align: center; }
+.diagram { font-family: monospace; font-size: 0.78rem; line-height: 1.5; white-space: pre; overflow-x: auto; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px; padding: 1rem; }
+
+.callout { border: 1px solid var(--rule); border-left: 4px solid var(--accent); border-radius: 6px; padding: 0.7rem 1.1rem; margin: 1.5rem 0; background: var(--accent-soft); }
+.callout strong:first-child { display: block; color: var(--accent); }
+
+.practice { border: 1px solid #cbd5e1; border-left: 4px solid #2563eb; background: #f8fafc; border-radius: 6px; padding: 0.8rem 1.2rem; margin: 1.5rem 0; }
+.practice > strong:first-child { display: block; color: #1d4ed8; margin-bottom: 0.35rem; }
+
+/* 测验组件：quiz.js 驱动 */
+.quiz { border: 1px dashed var(--rule); border-radius: 6px; padding: 0.9rem 1.2rem; margin: 1.5rem 0; }
+.quiz h4 { margin-top: 0; }
+.quiz .options { display: grid; gap: 0.45rem; margin: 0.7rem 0; }
+.quiz button.option {
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.92rem;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: #fff;
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+}
+.quiz button.option:hover { border-color: var(--accent); }
+.quiz button.option.correct { border-color: var(--ok); background: var(--ok-bg); }
+.quiz button.option.wrong { border-color: var(--bad); background: var(--bad-bg); }
+.quiz .feedback { margin-top: 0.5rem; font-size: 0.9rem; min-height: 1.2em; }
+.quiz .feedback.correct { color: var(--ok); }
+.quiz .feedback.wrong { color: var(--bad); }
+.quiz details { margin-top: 0.6rem; }
+.quiz details summary { cursor: pointer; color: var(--accent); font-size: 0.9rem; }
+.quiz details .explain { margin-top: 0.4rem; font-size: 0.92rem; }
+
+footer.site {
+  margin-top: 4rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 1.25rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+footer.site a { color: var(--accent); }
+
+nav.course-nav { display: flex; justify-content: space-between; gap: 1rem; margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); font-size: 0.92rem; }
+nav.course-nav a.prev::before { content: "← "; }
+nav.course-nav a.next::after { content: " →"; }
+nav.course-nav .spacer { color: var(--muted); }
+
+table { border-collapse: collapse; width: 100%; margin: 1.5rem 0; font-size: 0.92rem; }
+th, td { border: 1px solid var(--rule); padding: 0.45rem 0.7rem; text-align: left; vertical-align: top; }
+th { background: var(--code-bg); }
+
+ul.toc { list-style: none; padding: 0; }
+ul.toc li { border-bottom: 1px solid var(--rule); padding: 0.5rem 0; }
+ul.toc .n { color: var(--accent); font-family: monospace; margin-right: 0.6rem; }
+ul.toc .d { color: var(--muted); font-size: 0.88rem; display: block; margin-left: 1.9rem; }
+
+.rec { border: 1px solid #e2e8f0; border-left: 4px solid #7c3aed; background: #faf5ff; border-radius: 6px; padding: 0.8rem 1.2rem; margin: 1.5rem 0; }
+.rec strong:first-child { display: block; color: #6b21a8; }
+
+.ask { background: #fffbeb; border: 1px solid #fde68a; border-left: 4px solid #f59e0b; border-radius: 6px; padding: 0.8rem 1.2rem; margin: 2rem 0; }
+.ask strong { color: #b45309; }
+
+.kbd { font-family: monospace; font-size: 0.85em; background: var(--code-bg); border: 1px solid var(--rule); border-bottom-width: 2px; border-radius: 4px; padding: 0.05em 0.4em; }
+
+@media print {
+  body { font-size: 11pt; padding: 0; }
+  main, header.site, footer.site, nav.course-nav { max-width: none; }
+  pre { white-space: pre-wrap; }
+  nav.course-nav, .quiz button.option { display: none; }
+  a { color: var(--ink); text-decoration: none; }
+  blockquote, .callout { border-left-width: 2px; }
+}

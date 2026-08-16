@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 Agent 基础 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 08 · 项目的智能核心</div>
+  <h1>Agent 基础：LLM 如何调用工具</h1>
+  <p class="subtitle">本课讲解 Agent 的概念与工作循环，然后解剖 <code>src/dataharness/agent/</code>：装配、工具、结构化输出、Runner。学完你就能理解「模型是怎么一步步完成分析的」。</p>
+</header>
+<main>
+
+<h2>1. Agent 是什么</h2>
+<p>一个普通 LLM 只会「你问一句，它答一句」。<b>Agent（智能体）= LLM + 工具 + 循环</b>：模型可以在对话中<b>请求调用工具</b>（比如搜文件、执行代码），拿到结果后继续思考，直到得出结论。循环长这样：</p>
+<div class="diagram">用户问题
+  │
+  ▼
+┌──────────────────────────────┐
+│ Agent 循环（PydanticAI 负责）│
+│  1. 模型：根据上下文决定下一步  │
+│     - 要么输出最终答案        │
+│     - 要么请求调用某个工具     │
+│  2. 执行工具 → 结果回填对话    │
+│  3. 回到 1                    │
+└──────────────────────────────┘
+  │
+  ▼
+最终答案（结构化 JSON）</div>
+<p>PydanticAI 是这个循环的官方实现（依赖声明 <span class="cite">pyproject.toml:14</span>）。项目自己的代码不做第二套 Agent Loop —— 它只负责<b>装配与约束</b>（<span class="cite">ARCHITECTURE.md:155-158</span>）。</p>
+
+<h2>2. 装配：create_agent</h2>
+<p>整个项目只有一个 Agent（<span class="cite">ARCHITECTURE.md:688-691</span>）。它的装配函数在 <code>agent/assembly.py:41-88</code>：</p>
+<pre><code>def create_agent(
+    *,
+    gateway: ModelGateway,
+    task_id: TaskId,
+    run_id: RunId | None = None,
+    skills: SkillRegistry,
+    active_skills: tuple[tuple[str, ContentHash | None], ...] = (),
+    memory: MemoryCapability | None = None,
+) -> Agent[AgentDependencies, AgentFinalOutput]:
+    """组装单一 PydanticAI Agent，并仅注册固定的窄工具。"""
+    tools = [
+        list_project_files, search_project, inspect_project_file,
+        get_project_coverage, execute_python, execute_sql,
+        preview_project_table, publish_chart, inspect_output, submit_finding,
+    ]
+    if loaded:
+        tools.append(run_skill_script)
+    if memory is not None:
+        tools.append(search_history)
+    instructions = (
+        "你是 DataHarness 的唯一分析 Agent。只能使用注册的窄工具；"
+        "不要访问主机路径、直接执行代码、安装依赖或创建第二个 Agent。"
+        "最终必须输出结构化 JSON，status 只能是 COMPLETED 或 WAITING；"
+        "无论 status 如何，都必须使用 answer 字段承载面向用户的说明…"
+    )
+    return Agent(
+        gateway_function_model(gateway, task_id, run_id),   # 模型：接 ModelGateway
+        output_type=AgentFinalOutput,                        # 输出必须是这个结构
+        deps_type=AgentDependencies,                         # 依赖：运行时要注入的对象
+        system_prompt=instructions,
+        tools=tools,
+        retries=1,                                           # 模型错误最多重试 1 次
+        name="dataharness-agent",
+    )</code></pre>
+<p>逐项拆解：</p>
+<ul>
+<li><b>模型</b>：<code>gateway_function_model(...)</code> 把 ModelGateway 包装成 PydanticAI 认识的 <code>FunctionModel</code>（<span class="cite">agent/model.py:71-90</span>）—— 所有模型流量都强制走隐私网关（第 09 课）。</li>
+<li><b>输出类型</b>：<code>AgentFinalOutput</code>（<span class="cite">agent/models.py:21-52</span>）强制模型最后输出 <code>status + answer + references + unresolved_issues</code> 的结构化 JSON。</li>
+<li><b>依赖</b>：<code>AgentDependencies</code>（<span class="cite">agent/models.py:55-73</span>）是工具能拿到的运行时对象包：AnalysisRuntime、SkillRegistry、ModelGateway、checkpoint 管理器等。</li>
+<li><b>系统提示词</b>：硬性约束。「只能使用注册的窄工具；不要访问主机路径、直接执行代码…」。注意最后一句：即使 WAITING 也要写 answer —— 这是和 DeepSeek 风格模型兼容的细节（<span class="cite">models.py:31-52</span> 有对应的解析兼容逻辑）。</li>
+</ul>
+<p>预算也是装配的一部分（<span class="cite">assembly.py:91-93</span>）：</p>
+<pre><code>def default_usage_limits() -> UsageLimits:
+    return UsageLimits(request_limit=20, tool_calls_limit=40, total_tokens_limit=50_000)</code></pre>
+<p>一次 Run 最多 20 次模型请求、40 次工具调用、5 万 token —— 这就是「预算与失控控制」的第一层（<span class="cite">ARCHITECTURE.md:541-551</span>）。</p>
+
+<h2>3. 工具：模型能做什么，全由我们定</h2>
+<p>工具定义在 <code>agent/tools.py</code>。每个工具是一个 async 函数，第一个参数是 <code>ctx: RunContext[AgentDependencies]</code>（PydanticAI 的约定），后续是模型传入的参数。看最有代表性的两个：</p>
+<pre><code># tools.py:73-84  —— 检索工具
+async def search_project(ctx: RunContext[AgentDependencies], query: str, limit: int = 20) -> str:
+    """ProjectCorpus FTS5/BM25 检索；回答只能引用实际返回的文件版本。"""
+    ...
+
+# tools.py:114-149 —— 执行代码工具
+async def execute_python(
+    ctx: RunContext[AgentDependencies],
+    code: str,
+    inputs: tuple[InputReference, ...] = (),
+    expected_outputs: tuple[OutputSpec, ...] = (),
+    timeout_seconds: int = 300,
+    budget_units: int = 1,
+) -> str:
+    """生成代码经 AnalysisRuntime 在 OpenSandbox 执行；Host 不 exec 任何代码。"""
+    ...</code></pre>
+<p>完整工具表（<span class="cite">ARCHITECTURE.md:303-316</span>）：</p>
+<table>
+<thead><tr><th>工具</th><th>干什么</th><th>代码位置</th></tr></thead>
+<tbody>
+<tr><td><code>list_project_files</code></td><td>列出快照里的文件版本</td><td><span class="cite">tools.py:60</span></td></tr>
+<tr><td><code>search_project</code></td><td>全文检索相关片段</td><td><span class="cite">tools.py:73</span></td></tr>
+<tr><td><code>inspect_project_file</code></td><td>有界读取文件内容（默认 4096 字符）</td><td><span class="cite">tools.py:86</span></td></tr>
+<tr><td><code>get_project_coverage</code></td><td>FULL_PROJECT 覆盖报告</td><td><span class="cite">tools.py:101</span></td></tr>
+<tr><td><code>execute_python</code></td><td>在沙箱执行 Python</td><td><span class="cite">tools.py:114</span></td></tr>
+<tr><td><code>execute_sql</code></td><td>在沙箱执行 SQL</td><td><span class="cite">tools.py:150</span></td></tr>
+<tr><td><code>preview_project_table</code></td><td>预览表前 N 行</td><td><span class="cite">tools.py:186</span></td></tr>
+<tr><td><code>publish_chart</code></td><td>发布 Vega-Lite 图表（Host 校验 spec）</td><td><span class="cite">tools.py:210</span></td></tr>
+<tr><td><code>inspect_output</code></td><td>读当前 Task staging 的输出</td><td><span class="cite">tools.py:233</span></td></tr>
+<tr><td><code>submit_finding</code></td><td>提交结论候选（过验证门才生效）</td><td><span class="cite">tools.py:248</span></td></tr>
+<tr><td><code>run_skill_script</code>（条件注册）</td><td>运行已激活 Skill 的脚本</td><td><span class="cite">tools.py:263</span></td></tr>
+<tr><td><code>search_history</code>（条件注册）</td><td>检索历史对话</td><td><span class="cite">tools.py:296</span></td></tr>
+</tbody>
+</table>
+<div class="callout">
+<strong>「窄工具」原则</strong>
+<p>不给模型：通用 shell、安装包、外部 API、浏览器、邮件、在线数据库（<span class="cite">ARCHITECTURE.md:316-317</span>）。
+模型的能力边界由工具清单精确划定 —— 工具越少，出错和越界的可能性越小。</p>
+</div>
+<p>每个工具的返回都经过统一出口（<span class="cite">tools.py:17-28</span>）：</p>
+<pre><code>text = json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)
+return ctx.deps.gateway.sanitize_tool_result(ctx.deps.task_id, text).cloud_text</code></pre>
+<p>工具结果在回填给模型之前，也要过 ModelGateway 的脱敏（第 09 课）。</p>
+
+<h2>4. 工具结果太长怎么办：有界化</h2>
+<p>模型上下文有限，工具结果不能无限大。项目的策略（<span class="cite">ARCHITECTURE.md:405</span>）：<b>大结果写进 Workspace，只给模型有界内容或引用</b>。例子：<code>inspect_project_file</code> 的 <code>max_chars=4096</code>（<span class="cite">tools.py:86-100</span>）；执行代码的 stdout/stderr 在 <code>AnalysisSummary</code> 里被截断（<code>max_summary_chars</code>，<span class="cite">analysis/runtime.py:435-471</span>）。</p>
+
+<h2>5. 一次 Run 的 Agent 流程：AgentRunHandler</h2>
+<p>把装配串起来的是 <code>AgentRunHandler.__call__</code>（<span class="cite">agent/handler.py:140-319</span>），它是第 11 课 Worker 调用的「Run 处理器」。流程：</p>
+<ol>
+<li>校验不可变的 <code>PROMPT.json</code>（prompt_ref/hash 对得上，<span class="cite">handler.py:74-96</span>）；</li>
+<li>闲聊检测：问候语直接本地回复，不调模型（<span class="cite">handler.py:150-154</span>，<span class="cite">agent/intent.py</span>）；</li>
+<li>依赖门：沙箱/发布桥缺失 → WAITING(MISSING_DEPENDENCY)（<span class="cite">handler.py:155-166</span>）；</li>
+<li>装配 ContextCheckpointManager、MemoryCapability、AnalysisRuntime 与 Dependencies（<span class="cite">handler.py:176-220</span>）；</li>
+<li><code>AgentRunner.run(...)</code> 执行 Agent 循环（<span class="cite">handler.py:236</span>）；</li>
+<li>错误映射：预算耗尽→WAITING(BUDGET_EXHAUSTED)、模型配置问题→WAITING(MISSING_DEPENDENCY)、模型输出异常→WAITING、检测到凭据→WAITING(POLICY_DENIED)（<span class="cite">handler.py:237-274</span>）；</li>
+<li>成功：写脱敏 ANSWER.json → 记忆 → 验证门处理 DRAFT Finding → 返回 RunOutcome（<span class="cite">handler.py:286-319</span>）。</li>
+</ol>
+<p>关键点：<b>Agent 自己决定不了 Run 的命运</b> —— 它只能产出「成功/等待」，最终状态由 Host（执行器）落库（第 11 课）。</p>
+
+<h2>6. Runner 与 Checkpoint：长任务怎么不丢记忆</h2>
+<p><code>AgentRunner.run</code>（<span class="cite">agent/runner.py:34-109</span>）做了三件事：</p>
+<ol>
+<li><b>恢复</b>：从最近 checkpoint 恢复消息历史（崩溃后继续，不从头再来）；</li>
+<li><b>运行</b>：<code>self._agent.run(...)</code>，用完预算则保存未决问题后抛 <code>AgentBudgetExhausted</code>（<span class="cite">runner.py:59-70</span>）；</li>
+<li><b>保存</b>：成功后写完整消息 checkpoint；若序列化超过 <code>context_budget_chars</code>（默认 120,000），触发 <b>Compaction</b> —— 用模型把历史压缩成摘要（<span class="cite">runner.py:90-104</span>，<span class="cite">agent/context.py:199-242</span>）。</li>
+</ol>
+<p>Checkpoint 物理存放：<b>消息内容</b>在 Workspace 文件（<code>state/checkpoints/checkpoint-{sequence}.json</code>），<b>元数据</b>（run_id、hash、快照、沙箱、lease epoch）在 Runtime SQLite 的 <code>checkpoint_metadata</code> 表（<span class="cite">agent/context.py:114-146</span>）。恢复时校验 hash 与快照绑定（<span class="cite">agent/context.py:148-171</span>）。第 11 课的「恢复决策」就靠它。</p>
+
+<h2>7. 练习</h2>
+<div class="practice">
+<strong>练习：读工具实现</strong>
+<ol>
+<li>打开 <code>agent/tools.py</code>，读 <code>submit_finding</code>（248 行附近）完整实现，找出它如何构造 <code>FindingCandidate</code> 并记录「模型请求了验证」。</li>
+<li>读 <code>agent/intent.py</code> 的 <code>classify_prompt</code>，理解「闲聊短接」的判定条件。</li>
+<li>打开 <code>agent/models.py</code>，说出 <code>AgentFinalOutput</code> 的每个字段及其约束（min/max）。</li>
+<li>思考题：为什么系统提示词里写「checkpoint summary 只是摘要，不是事实」？读完 <span class="cite">runner.py:90-104</span> 后回答。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：Agent 的「能力边界」由什么决定？</h4>
+<div class="options">
+  <button class="option" data-correct="false">模型的大小</button>
+  <button class="option" data-correct="false">系统提示词的语气</button>
+  <button class="option" data-correct="true">注册给它的工具清单</button>
+  <button class="option" data-correct="false">用户的问题内容</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>assembly.py:54-69</code>：模型只能调用注册的工具。不给通用 shell、不装包、不联网，模型就「无计可施」——这是硬边界，比提示词约束可靠。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：Agent 输出 status=WAITING 时，Run 会怎样？</h4>
+<div class="options">
+  <button class="option" data-correct="false">直接失败，任务结束</button>
+  <button class="option" data-correct="true">Run 进入 WAITING 状态并带 wait_reason，可被用户恢复/补充后继续</button>
+  <button class="option" data-correct="false">自动无限重试</button>
+  <button class="option" data-correct="false">当作成功</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+WAITING + wait_reason（第 05 课的不变量！）意味着「卡住了，需要外部介入」——用户补充信息（USER_INPUT）、预算耗尽（BUDGET_EXHAUSTED）、缺依赖（MISSING_DEPENDENCY）等（<span class="cite">handler.py:237-274</span>）。恢复由第 11 课的 resume 机制处理。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="https://ai.pydantic.dev/agents/">PydanticAI 官方文档：Agents</a>（Agent、Tools、Structured Output 三节）。
+这是本项目唯一的 Agent 框架依赖，文档质量很高。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「RunContext 是什么？」「PydanticAI 的 retries 和项目自己的重试有什么区别？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="07-project-corpus.html">上一课：文件导入与检索</a>
+  <a class="next" href="09-model-gateway-privacy.html">下一课：模型网关与隐私</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 08 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

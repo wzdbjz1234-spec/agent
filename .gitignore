@@ -19,3 +19,11 @@ uv.lock.tmp
 
 # Runtime data root（项目默认数据目录，与 dataharness.example.toml 一致）
 runtime-data/
+
+# Local WebUI dependency/build/test outputs
+web/node_modules/
+web/test-results/
+web/playwright-report/
+
+# Phase 13 本机部署状态与脱敏日志（可重建，不进入仓库）
+.dataharness/

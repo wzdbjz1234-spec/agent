@@ -5,7 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from dataharness.domain import ContentHash, FileId, FileVersionId, ProjectId, StepId, TaskId
+from dataharness.domain import (
+    ContentHash,
+    FileId,
+    FileVersionId,
+    ProjectId,
+    SnapshotId,
+    StepId,
+    TaskId,
+)
 
 from .models import PublicationRecord, PublicationStatus, WorkspaceResource
 
@@ -36,6 +44,15 @@ class VirtualWorkspace(Protocol):
     def extracted_path(self, project_id: ProjectId, version_id: FileVersionId) -> Path: ...
 
     def index_path(self, project_id: ProjectId) -> Path: ...
+
+    def materialize_snapshot(
+        self,
+        project_id: ProjectId,
+        snapshot_id: SnapshotId,
+        files: tuple[tuple[FileId, FileVersionId, str], ...],
+    ) -> None: ...
+
+    def snapshot_path(self, project_id: ProjectId, snapshot_id: SnapshotId) -> Path: ...
 
     def write_manifest(
         self, project_id: ProjectId, name: str, data: bytes
@@ -76,6 +93,10 @@ class VirtualWorkspace(Protocol):
     def publish_staged(self, record: PublicationRecord) -> WorkspaceResource: ...
 
     def resource_exists(self, record: PublicationRecord) -> bool: ...
+
+    def read_published_resource(
+        self, record: PublicationRecord, max_bytes: int = 10 * 1024 * 1024
+    ) -> bytes: ...
 
 
 class PublicationJournal(Protocol):

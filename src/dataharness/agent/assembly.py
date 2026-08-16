@@ -6,7 +6,7 @@ from pydantic_ai import Agent
 from pydantic_ai.usage import UsageLimits
 
 from dataharness.capabilities.memory import MemoryCapability
-from dataharness.domain import ContentHash, TaskId
+from dataharness.domain import ContentHash, RunId, TaskId
 from dataharness.privacy import ModelGateway
 from dataharness.skills import LoadedSkill, SkillRegistry
 
@@ -15,9 +15,12 @@ from .models import AgentDependencies, AgentFinalOutput
 from .tools import (
     execute_python,
     execute_sql,
+    get_project_coverage,
     inspect_output,
     inspect_project_file,
     list_project_files,
+    preview_project_table,
+    publish_chart,
     run_skill_script,
     search_history,
     search_project,
@@ -39,6 +42,7 @@ def create_agent(
     *,
     gateway: ModelGateway,
     task_id: TaskId,
+    run_id: RunId | None = None,
     skills: SkillRegistry,
     active_skills: tuple[tuple[str, ContentHash | None], ...] = (),
     memory: MemoryCapability | None = None,
@@ -51,8 +55,11 @@ def create_agent(
         list_project_files,
         search_project,
         inspect_project_file,
+        get_project_coverage,
         execute_python,
         execute_sql,
+        preview_project_table,
+        publish_chart,
         inspect_output,
         submit_finding,
     ]
@@ -66,11 +73,12 @@ def create_agent(
         "跨文件检索必须使用 ProjectCorpus 工具，历史检索只能用于辅助上下文。"
         "checkpoint summary 只是摘要，不是事实；所有 Dataset、Artifact、Finding 和文件事实"
         "必须来自工具返回的稳定引用。"
-        "最终必须输出结构化 JSON，status 只能是 COMPLETED 或 WAITING，"
-        "并列出 unresolved_issues。\n\n" + _skill_instructions(loaded)
+        "最终必须输出结构化 JSON，status 只能是 COMPLETED 或 WAITING；无论 status 如何，"
+        "都必须使用 answer 字段承载面向用户的说明，不要使用 summary 字段，并列出"
+        " unresolved_issues。\n\n" + _skill_instructions(loaded)
     )
     return Agent(
-        gateway_function_model(gateway, task_id),
+        gateway_function_model(gateway, task_id, run_id),
         output_type=AgentFinalOutput,
         deps_type=AgentDependencies,
         system_prompt=instructions,

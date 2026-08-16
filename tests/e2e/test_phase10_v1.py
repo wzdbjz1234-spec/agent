@@ -196,7 +196,8 @@ def test_privacy_and_malicious_input_set_is_fail_closed(tmp_path: Path) -> None:
         content=b"0" * 200,
         headers={"x-file-name": "large.txt", "content-type": "application/octet-stream"},
     )
-    assert oversized.status_code == 400
+    # 超限请求在流式读取阶段即被拒绝；413 明确表示服务没有把完整 body 载入内存。
+    assert oversized.status_code == 413
     with pytest.raises(UnsafePathError):
         normalize_filename("../../runtime.db")
 

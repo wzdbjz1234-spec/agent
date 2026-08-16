@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 FastAPI 入门 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 03 · 第一个大模块</div>
+  <h1>FastAPI 入门：逐行读懂 API 层</h1>
+  <p class="subtitle">本课用 <code>src/dataharness/api/app.py</code>（339 行）作为教材，学完你将掌握 FastAPI 的核心概念，并看懂 DataHarness 的全部 30 个 HTTP 路由。</p>
+</header>
+<main>
+
+<h2>1. FastAPI 的心智模型</h2>
+<p>FastAPI 只有 5 个核心概念，全部在本项目出现：</p>
+<table>
+<thead><tr><th>概念</th><th>作用</th><th>本项目的例子</th></tr></thead>
+<tbody>
+<tr><td><b>路由</b> <code>@app.get("/path")</code></td><td>把 URL 绑定到函数</td><td><code>app.py:134</code> 的 <code>/healthz</code></td></tr>
+<tr><td><b>中间件</b> <code>@app.middleware("http")</code></td><td>请求处理前后插入逻辑（如日志、鉴权）</td><td><code>app.py:50-86</code> 两个中间件</td></tr>
+<tr><td><b>异常处理器</b> <code>@app.exception_handler(X)</code></td><td>把异常转成统一的 HTTP 响应</td><td><code>app.py:88-132</code> 五个处理器</td></tr>
+<tr><td><b>请求模型</b>（Pydantic BaseModel）</td><td>自动校验请求体/头/查询参数</td><td><code>api/models.py</code> 的 <code>CreateProjectRequest</code> 等</td></tr>
+<tr><td><b>依赖注入</b></td><td>自动构建函数的依赖参数</td><td>本项目用应用工厂注入服务（见下）</td></tr>
+</tbody>
+</table>
+
+<h2>2. 应用工厂：create_app</h2>
+<p>整个 API 是一个函数创建的（<span class="cite">api/app.py:34-48</span>）：</p>
+<pre><code>def create_app(
+    services: ApiService | None = None,
+    *,
+    static_dir: Path | None = None,
+) -> FastAPI:
+    """创建可注入服务的 FastAPI 实例，并可选挂载同源 WebUI 构建产物。"""
+    service = services or build_default_service()
+    app = FastAPI(title="DataHarness", version="0.1.0", docs_url="/docs", redoc_url=None)
+    app.state.services = service</code></pre>
+<ul>
+<li><b>工厂模式</b>：不创建全局单例 app，而是每次调用生成新实例 —— 测试可以注入假服务（第 13 课会用它跑通验证）。</li>
+<li><code>app.state.services</code>：FastAPI 官方推荐的「把业务对象挂到 app 上」的方式，路由里通过 <code>request.app.state.services</code> 取用。</li>
+<li><code>docs_url="/docs"</code>：自动生成交互式 API 文档（Swagger UI）。启动服务后打开 <code>http://127.0.0.1:8000/docs</code> 就能看到全部接口并可在线试调。</li>
+<li><code>service</code> 就是 <b>ApiService</b>（<code>api/services.py:46-63</code>），一个面向 API 层的业务门面：路由只做「参数校验 + 调用 service + 返回 DTO」，不碰 SQLite/Sandbox/模型 SDK。这叫<b>薄 API</b>（<span class="cite">ARCHITECTURE.md:94</span>）。</li>
+</ul>
+
+<h2>3. 中间件：每个请求都要经过的关卡</h2>
+<p>第一个中间件解决一个前端工程问题 —— 浏览器直接刷新前端路由时返回 SPA 页面（<span class="cite">api/app.py:50-59</span>）：</p>
+<pre><code>@app.middleware("http")
+async def serve_spa_navigation(request: Request, call_next):
+    """浏览器直接刷新前端路由时返回 SPA shell，同时保留 JSON API 路由优先级。"""
+    accepts_html = "text/html" in request.headers.get("accept", "")
+    excluded = {"/docs", "/openapi.json", "/healthz", "/readyz", "/diagnostics"}
+    if static_index is not None and request.method == "GET" and accepts_html:
+        path = request.url.path
+        if path not in excluded and not path.startswith("/assets/"):
+            return FileResponse(static_index)
+    return await call_next(request)</code></pre>
+<p>第二个中间件做可观测性（<span class="cite">api/app.py:61-86</span>）：记录每个请求的状态码、耗时、错误类型，并且<b>故意不记录请求路径</b>（注释：避免意外携带敏感参数）。这是本项目的安全习惯——「能不记就不记」。</p>
+<div class="callout">
+<strong>中间件的执行顺序</strong>
+<p>请求先进入中间件 → <code>await call_next(request)</code> 把请求交给下一个中间件/路由 → 响应返回时继续执行 `call_next` 之后的代码。中间件 1 在最外层，所以它会先收到请求。</p>
+</div>
+
+<h2>4. 异常映射：统一的错误格式</h2>
+<p>五个异常处理器把「任何可能的错误」折叠成同一个 JSON 结构（<span class="cite">api/app.py:88-132</span>）：</p>
+<pre><code>{"error": {"code": "NOT_FOUND", "message": "请求的资源不存在"}}</code></pre>
+<table>
+<thead><tr><th>异常</th><th>HTTP 状态</th><th>错误码</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><code>ApiError</code>（业务错误）</td><td>自定义</td><td>自定义</td><td>API 层唯一能"主动抛"的业务错误（<span class="cite">api/errors.py:8-14</span>）</td></tr>
+<tr><td><code>RequestValidationError</code></td><td>422</td><td>INVALID_REQUEST</td><td>Pydantic 校验失败</td></tr>
+<tr><td><code>RecordNotFoundError</code></td><td>404</td><td>NOT_FOUND</td><td>存储层抛的"查无此记录"</td></tr>
+<tr><td><code>ValueError</code></td><td>400</td><td>INVALID_OPERATION</td><td>状态/边界约束不满足</td></tr>
+<tr><td><code>Exception</code>（兜底）</td><td>500</td><td>INTERNAL_ERROR</td><td>刻意隐藏 SQL/路径/SDK 细节（<span class="cite">app.py:126</span>）</td></tr>
+</tbody>
+</table>
+<p>顺序很重要：越具体的异常越先注册。兜底的 <code>Exception</code> 处理器保证<b>任何</b>崩溃都返回统一格式，不把内部信息泄露给调用方。</p>
+
+<h2>5. 路由解剖：从最简单到最复杂</h2>
+
+<h3>5.1 健康检查（<span class="cite">api/app.py:134-141</span>）</h3>
+<pre><code>@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+@app.get("/readyz")
+async def readyz() -> dict[str, str]:
+    # SqliteRuntimeStore 构造时已完成迁移；这里不读取底层连接，避免健康检查改写业务状态。
+    return {"status": "ready"}</code></pre>
+<p>约定：<code>/healthz</code> 表示进程活着；<code>/readyz</code> 表示依赖就绪。注意 <code>readyz</code> 故意不做数据库探测 —— 只读探测也可能触发 WAL 写入。</p>
+
+<h3>5.2 创建资源（<span class="cite">api/app.py:148-150</span>）</h3>
+<pre><code>@app.post("/projects", status_code=201)
+async def create_project(payload: CreateProjectRequest) -> dict[str, object]:
+    return service.create_project(payload.name).model_dump(mode="json")</code></pre>
+<ul>
+<li><code>payload: CreateProjectRequest</code> —— FastAPI 自动解析请求 JSON、按 Pydantic 模型校验、把错误转成 422。</li>
+<li><code>status_code=201</code> —— 创建成功返回 201。</li>
+<li>业务逻辑全在 <code>service.create_project</code>（<span class="cite">api/services.py:152</span> → <code>corpus.create_project(name)</code>）。</li>
+</ul>
+
+<h3>5.3 上传文件（<span class="cite">api/app.py:186-191</span>）—— 最有意思的路由</h3>
+<pre><code>@app.post("/projects/{project_id}/files", status_code=201)
+async def import_file(
+    project_id: str,
+    data: Annotated[bytes, Body(media_type="application/octet-stream")],
+    x_file_name: Annotated[str, Header(min_length=1, max_length=255)],
+) -> dict[str, object]:
+    return service.import_file_bytes(project_id, x_file_name, data).model_dump(mode="json")</code></pre>
+<ul>
+<li>路径参数 <code>{project_id}</code>、原始字节体 <code>data</code>、请求头 <code>X-File-Name</code> —— 三个来源的参数在一个函数签名里声明，FastAPI 全自动解析校验。</li>
+<li>文件名走请求头而不是 multipart 表单 —— 这是官方 REST 惯例（curl 用法见 <span class="cite">README.md:280</span>）。</li>
+<li>body 接收的是<b>原始字节</b>：先落临时文件、验文件名、再走导入管线（<code>api/services.py:197-219</code>，第 07 课详讲）。</li>
+</ul>
+
+<h3>5.4 文件内容下载（<span class="cite">api/app.py:202-210</span>）</h3>
+<pre><code>@app.get("/projects/{project_id}/files/{file_id}/versions/{version_id}/content")
+async def file_content(
+    project_id: str, file_id: str, version_id: str,
+    snapshot_id: Annotated[str, Query(min_length=1)],
+) -> Response:
+    data, media_type = service.read_file(project_id, file_id, version_id, snapshot_id)
+    return Response(content=data, media_type=media_type)</code></pre>
+<p>注意 <code>snapshot_id</code> 是<b>必填查询参数</b>——文件必须挂在某个 Snapshot 下读取（保证读的是 Run 固定的版本，第 07 课讲 Snapshot 的语义）。</p>
+
+<h2>6. ApiService：路由背后的业务门面</h2>
+<p><code>ApiService</code>（<span class="cite">api/services.py:46-63</span>）把 HTTP 层和基础设施完全隔离。它的构造函数注入：</p>
+<ul>
+<li><code>store: SqliteRuntimeStore</code> —— 查询/写状态；</li>
+<li><code>corpus: ProjectCorpus</code> —— 项目文件与检索；</li>
+<li><code>tasks / runs / sessions</code> —— 三个领域服务；</li>
+<li><code>workspace / bridge / verification</code> —— 工作区、发布、验证；</li>
+<li><code>observability</code> —— 遥测适配器。</li>
+</ul>
+<p>从配置一键装配的方法在 <code>ApiService.from_settings</code>（<span class="cite">api/services.py:91-142</span>）—— 这是「组装根」，把 config → SQLite → 服务 → 门面串起来。</p>
+
+<h2>7. 你自己加一个路由试试</h2>
+<div class="practice">
+<strong>练习：给 API 加一个统计路由</strong>
+<ol>
+<li>在 <code>api/app.py</code> 里仿照 <code>/healthz</code> 加一个路由：<code>GET /api/version</code>，返回 <code>{"name": "dataharness", "version": "0.1.0"}</code>。</li>
+<li>运行 <code>uv run dataharness serve</code>，访问 <code>http://127.0.0.1:8000/api/version</code> 验证。</li>
+<li>再访问一个不存在的路径（如 <code>/nope</code>），观察返回的错误 JSON 格式 —— 是哪一层帮你处理的？</li>
+<li>打开 <code>http://127.0.0.1:8000/docs</code>，找到你的新路由。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：抛 ValueError 的接口返回什么？</h4>
+<div class="options">
+  <button class="option" data-correct="false">500 + INTERNAL_ERROR</button>
+  <button class="option" data-correct="false">404 + NOT_FOUND</button>
+  <button class="option" data-correct="true">400 + INVALID_OPERATION</button>
+  <button class="option" data-correct="false">422 + INVALID_REQUEST</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>app.py:115-122</code>：<code>ValueError</code> 被映射为 400 INVALID_OPERATION，message 是「请求不满足当前状态或边界约束」。比如给已归档的 Project 导入文件就会触发这种错误（<span class="cite">projects/corpus.py:96-98</span>）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：为什么 readyz 不探测数据库？</h4>
+<div class="options">
+  <button class="option" data-correct="false">因为 SQLite 不需要探测</button>
+  <button class="option" data-correct="true">避免健康检查触发数据库写入/迁移，产生副作用</button>
+  <button class="option" data-correct="false">数据库探测太重，会拖慢启动</button>
+  <button class="option" data-correct="false">因为 API 根本不用数据库</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+代码注释（<span class="cite">app.py:140</span>）：「SqliteRuntimeStore 构造时已完成迁移；这里不读取底层连接，避免健康检查改写业务状态」。健康检查必须零副作用，这是运维常识。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="https://fastapi.tiangolo.com/tutorial/first-steps/">FastAPI 官方教程：第一步</a>（路由、路径参数、查询参数、请求体），
+以及 <a href="https://fastapi.tiangolo.com/tutorial/middleware/">中间件</a> 和 <a href="https://fastapi.tiangolo.com/tutorial/handling-errors/">异常处理</a> 两章。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「Annotated[...] 是什么意思？」「为什么不给路由声明 response_model？」它可以用仓库代码举例解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="02-python-web-basics.html">上一课：Python 与 Web 基础</a>
+  <a class="next" href="04-config-system.html">下一课：配置系统</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 03 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

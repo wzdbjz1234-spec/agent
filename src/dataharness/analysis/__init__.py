@@ -1,5 +1,13 @@
 """可审计分析运行时与结构化结果。"""
 
+from .charts import (
+    ChartArtifact,
+    ChartSpecError,
+    build_png_fallback,
+    build_svg_fallback,
+    chart_content_hash,
+    validate_vega_lite_spec,
+)
 from .errors import (
     AnalysisBudgetError,
     AnalysisCircuitOpenError,
@@ -39,6 +47,11 @@ __all__ = [
     "AnalysisMode",
     "AnalysisRequest",
     "AnalysisRuntime",
+    "ChartArtifact",
+    "ChartSpecError",
+    "build_png_fallback",
+    "build_svg_fallback",
+    "chart_content_hash",
     "DataWarning",
     "DataWarningDetector",
     "DataWarningKind",
@@ -58,4 +71,5 @@ __all__ = [
     "ProjectFileView",
     "VerificationError",
     "VerificationService",
+    "validate_vega_lite_spec",
 ]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 from dataharness.domain import (
@@ -30,6 +30,7 @@ from dataharness.domain import (
     ProjectSnapshot,
     ResourceKind,
     ResourceRef,
+    Run,
     RunId,
     SnapshotId,
     StepFailureKind,
@@ -60,6 +61,7 @@ from dataharness.workspace import (
     WorkspaceBridge,
 )
 
+from .charts import ChartArtifact, chart_content_hash, validate_vega_lite_spec
 from .errors import AnalysisBudgetError, AnalysisCircuitOpenError, AnalysisContextError
 from .models import (
     AnalysisMode,
@@ -91,8 +93,10 @@ class AnalysisRuntime:
         corpus: ProjectCorpus,
         workspace: VirtualWorkspace,
         sandbox: SandboxProvider,
-        lease: SandboxLease,
+        lease: SandboxLease | None,
         *,
+        run: Run | None = None,
+        sandbox_lease_factory: Callable[[], Awaitable[SandboxLease]] | None = None,
         bridge: WorkspaceBridge | None = None,
         id_factory: IdFactory | None = None,
         clock: Callable[[], datetime] = utcnow,
@@ -105,6 +109,19 @@ class AnalysisRuntime:
         self._workspace = workspace
         self._sandbox = sandbox
         self._lease = lease
+        if lease is None:
+            if run is None:
+                raise ValueError("Sandbox lease 缺失时必须提供固定 Run 上下文")
+            self._run_id = run.id
+            self._task_id = run.task_id
+            self._project_id = run.project_id
+            self._snapshot_id = run.project_snapshot_id
+        else:
+            self._run_id = lease.run_id
+            self._task_id = lease.task_id
+            self._project_id = lease.project_id
+            self._snapshot_id = lease.project_snapshot_id
+        self._sandbox_lease_factory = sandbox_lease_factory
         self._bridge = bridge
         self._ids = id_factory or UuidIdFactory()
         self._clock = clock
@@ -114,22 +131,39 @@ class AnalysisRuntime:
         self._cache: dict[str, AnalysisSummary] = {}
         self._failure_counts: dict[str, int] = {}
 
-    def _context(self) -> tuple[TaskId, RunId, ProjectId, SnapshotId]:
-        """从 lease 得到不可伪造的 Run 上下文，并确认 Runtime DB 中的 Run 一致。"""
-        with self._store.unit_of_work() as uow:
-            run = uow.repo.get_run(self._lease.run_id).value
+    async def _ensure_lease(self) -> SandboxLease:
+        """在第一次执行型工具调用时取得并校验 Sandbox lease。"""
+        if self._lease is not None:
+            return self._lease
+        if self._sandbox_lease_factory is None:
+            raise AnalysisContextError("当前分析 Run 未配置 Sandbox 按需创建器")
+        lease = await self._sandbox_lease_factory()
         if (
-            run.task_id != self._lease.task_id
-            or run.project_id != self._lease.project_id
-            or run.project_snapshot_id != self._lease.project_snapshot_id
+            lease.run_id != self._run_id
+            or lease.task_id != self._task_id
+            or lease.project_id != self._project_id
+            or lease.project_snapshot_id != self._snapshot_id
         ):
-            raise AnalysisContextError("Sandbox lease 与 Runtime Run 的固定上下文不一致")
+            raise AnalysisContextError("按需取得的 Sandbox lease 与固定 Run 上下文不一致")
+        self._lease = lease
+        return lease
+
+    def _context(self) -> tuple[TaskId, RunId, ProjectId, SnapshotId]:
+        """确认 Runtime DB 中的 Run 与固定上下文一致。"""
+        with self._store.unit_of_work() as uow:
+            run = uow.repo.get_run(self._run_id).value
+        if (
+            run.task_id != self._task_id
+            or run.project_id != self._project_id
+            or run.project_snapshot_id != self._snapshot_id
+        ):
+            raise AnalysisContextError("Runtime Run 与固定分析上下文不一致")
         return run.task_id, run.id, run.project_id, run.project_snapshot_id
 
     def _snapshot(self) -> ProjectSnapshot:
         """返回 lease 固定的 Snapshot；不读取项目最新版本替代它。"""
         with self._store.unit_of_work() as uow:
-            return uow.repo.get_snapshot(self._lease.project_snapshot_id)
+            return uow.repo.get_snapshot(self._snapshot_id)
 
     def _validate_inputs(self, inputs: tuple[InputReference, ...]) -> None:
         """校验所有输入属于当前 Snapshot 且 hash 与事实源一致。"""
@@ -158,13 +192,13 @@ class AnalysisRuntime:
             "image_digest": image_digest,
         }
 
-    def _request_hash(self, request: AnalysisRequest) -> ContentHash:
-        normalized = self._normalized_request(request, self._lease.image_digest)
+    def _request_hash(self, request: AnalysisRequest, image_digest: str) -> ContentHash:
+        normalized = self._normalized_request(request, image_digest)
         payload = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return compute_content_hash(payload)
 
     def _default_staging_ref(self) -> str:
-        return f"task:{self._lease.task_id}:staging"
+        return f"task:{self._task_id}:staging"
 
     def _validate_staging_ref(self, staging_ref: str) -> None:
         if staging_ref != self._default_staging_ref():
@@ -172,7 +206,7 @@ class AnalysisRuntime:
 
     def _idempotency_key(self, request_hash: ContentHash) -> str:
         """返回绑定 Run 的幂等键；同一规范请求不能跨 Run 复用结果。"""
-        return f"{self._lease.run_id}:{request_hash}"
+        return f"{self._run_id}:{request_hash}"
 
     def _reserve_idempotency(self, request_hash: ContentHash) -> IdempotencyRecord:
         key = self._idempotency_key(request_hash)
@@ -189,8 +223,8 @@ class AnalysisRuntime:
     def _summary_path(self, step_id: StepId):
         """返回内部摘要文件位置；完整业务输出仍由 Workspace 发布协议管理。"""
         return self._workspace.staging_path(
-            self._lease.project_id,
-            self._lease.task_id,
+            self._project_id,
+            self._task_id,
             step_id,
             "analysis-summary.json",
         )
@@ -207,7 +241,7 @@ class AnalysisRuntime:
 
     def _new_step(self) -> tuple[AnalysisStep, int]:
         step = AnalysisStep(
-            id=StepId(self._ids.new("step")), run_id=self._lease.run_id, created_at=self._clock()
+            id=StepId(self._ids.new("step")), run_id=self._run_id, created_at=self._clock()
         )
         with self._store.unit_of_work() as uow:
             uow.repo.add_step(step)
@@ -234,7 +268,7 @@ class AnalysisRuntime:
     def _write_staging(self, step_id: StepId, name: str, data: bytes) -> ContentHash:
         """Host 只把 Sandbox 已返回的结果写入当前 Step staging，并以原子替换落盘。"""
         target = self._workspace.staging_path(
-            self._lease.project_id, self._lease.task_id, step_id, name
+            self._project_id, self._task_id, step_id, name
         )
         temporary = target.with_name(f".{target.name}.writing")
         temporary.unlink(missing_ok=True)
@@ -261,9 +295,9 @@ class AnalysisRuntime:
             available = False
             if self._bridge is not None:
                 record = self._bridge.stage(
-                    project_id=self._lease.project_id,
-                    task_id=self._lease.task_id,
-                    run_id=self._lease.run_id,
+                    project_id=self._project_id,
+                    task_id=self._task_id,
+                    run_id=self._run_id,
                     step_id=step_id,
                     output_name=output.name,
                     kind=output.kind,
@@ -278,9 +312,9 @@ class AnalysisRuntime:
                         uow.repo.add_dataset(
                             Dataset(
                                 id=DatasetId(resource_id),
-                                project_id=self._lease.project_id,
-                                task_id=self._lease.task_id,
-                                run_id=self._lease.run_id,
+                                project_id=self._project_id,
+                                task_id=self._task_id,
+                                run_id=self._run_id,
                                 name=published.name,
                                 content_hash=published.content_hash,
                                 created_at=self._clock(),
@@ -290,9 +324,9 @@ class AnalysisRuntime:
                         uow.repo.add_artifact(
                             Artifact(
                                 id=ArtifactId(resource_id),
-                                project_id=self._lease.project_id,
-                                task_id=self._lease.task_id,
-                                run_id=self._lease.run_id,
+                                project_id=self._project_id,
+                                task_id=self._task_id,
+                                run_id=self._run_id,
                                 name=published.name,
                                 content_hash=published.content_hash,
                                 created_at=self._clock(),
@@ -302,7 +336,7 @@ class AnalysisRuntime:
                         uow.repo.add_lineage(
                             Lineage(
                                 id=LineageId(self._ids.new("lineage")),
-                                run_id=self._lease.run_id,
+                                run_id=self._run_id,
                                 source=ResourceRef(
                                     kind=ResourceKind.FILE_VERSION,
                                     resource_id=str(input_ref.file_version_id),
@@ -323,7 +357,7 @@ class AnalysisRuntime:
                     uow.repo.add_lineage(
                         Lineage(
                             id=LineageId(self._ids.new("lineage")),
-                            run_id=self._lease.run_id,
+                            run_id=self._run_id,
                             source=ResourceRef(
                                 kind=ResourceKind.STEP,
                                 resource_id=str(step_id),
@@ -355,13 +389,15 @@ class AnalysisRuntime:
 
     async def execute(self, request: AnalysisRequest) -> AnalysisSummary:
         """统一执行入口：校验上下文、幂等/熔断、创建 Step、Sandbox 执行和输出发布。"""
+        # 只有进入执行工具才取得 Sandbox；只读工具不会触发隔离环境创建。
+        lease = await self._ensure_lease()
         task_id, run_id, project_id, snapshot_id = self._context()
         del task_id, run_id, project_id, snapshot_id
         self._validate_inputs(request.inputs)
         self._validate_staging_ref(request.staging_ref)
         if request.budget_units > self._max_budget_units:
             raise AnalysisBudgetError("请求预算超过 AnalysisRuntime 上限")
-        request_hash = self._request_hash(request)
+        request_hash = self._request_hash(request, lease.image_digest)
         cached = self._cache.get(str(request_hash))
         if cached is not None:
             return cached
@@ -387,7 +423,7 @@ class AnalysisRuntime:
         )
         step_finalized = False
         try:
-            result = await self._sandbox.execute(self._lease, sandbox_request)
+            result = await self._sandbox.execute(lease, sandbox_request)
             if result.status != ExecutionStatus.SUCCEEDED:
                 error = SandboxError(f"Sandbox 返回 {result.status}")
                 raise error
@@ -523,7 +559,7 @@ class AnalysisRuntime:
     ):
         """在固定 Snapshot 内执行元数据过滤 + FTS5/BM25 RELEVANT 检索。"""
         return self._corpus.search(
-            self._lease.project_snapshot_id, query, limit=limit, media_types=media_types
+            self._snapshot_id, query, limit=limit, media_types=media_types
         )
 
     def inspect_project_file(
@@ -531,7 +567,7 @@ class AnalysisRuntime:
     ) -> ProjectFileInspection:
         """读取固定 Snapshot 内一个版本的有界片段，不暴露 Workspace 路径。"""
         opened = self._corpus.open_resource(
-            self._lease.project_snapshot_id, FileVersionId(file_version_id), max_bytes=max_bytes
+            self._snapshot_id, FileVersionId(file_version_id), max_bytes=max_bytes
         )
         text = opened.data.decode("utf-8", errors="replace")
         return ProjectFileInspection(
@@ -581,7 +617,129 @@ class AnalysisRuntime:
 
     def get_project_coverage(self) -> ProjectCoverageReport:
         """生成并持久化当前 Snapshot 的 FULL_PROJECT CoverageReport。"""
-        return self._corpus.full_project_coverage(self._lease.project_snapshot_id)
+        return self._corpus.full_project_coverage(self._snapshot_id)
+
+    def summaries_for_run(self) -> tuple[AnalysisSummary, ...]:
+        """从受控 staging 重建当前 Run 的成功摘要，供 Host Verification 使用。
+
+        Runtime 只保存 Step 元数据，完整摘要留在 Workspace；该方法通过稳定 Step ID
+        读取有界 ``analysis-summary.json``，因此恢复不会依赖 Worker 内存中的临时列表。
+        """
+        with self._store.unit_of_work() as uow:
+            steps = uow.repo.list_steps_for_run(self._run_id)
+        summaries: list[AnalysisSummary] = []
+        for step in steps:
+            summary = self._load_durable_summary(step.id)
+            if summary is not None:
+                summaries.append(summary)
+        return tuple(summaries)
+
+    def publish_chart(
+        self,
+        dataset_id: str,
+        dataset_hash: str,
+        name: str,
+        spec: dict[str, object],
+    ) -> ChartArtifact:
+        """校验并发布绑定当前 Run Dataset 的 Vega-Lite ChartArtifact。
+
+        图表规范本身不是 Sandbox 代码；Host 先执行安全校验，再把规范作为普通
+        Artifact 发布。这样前端只需渲染已发布 JSON，永远不会执行模型生成的 HTML/JS。
+        """
+        _, run_id, project_id, snapshot_id = self._context()
+        if not name.casefold().endswith((".json", ".vl.json")):
+            raise AnalysisContextError("ChartArtifact 名称必须是 JSON 文件")
+        validate_vega_lite_spec(spec, dataset_id, dataset_hash)
+        with self._store.unit_of_work() as uow:
+            dataset = uow.repo.get_dataset(DatasetId(dataset_id))
+            if (
+                dataset.project_id != project_id
+                or dataset.task_id != self._task_id
+                or dataset.run_id != run_id
+                or str(dataset.content_hash) != dataset_hash
+            ):
+                raise AnalysisContextError("图表 Dataset 不属于当前 Run 或 hash 不匹配")
+            steps = uow.repo.list_steps_for_run(run_id)
+            successful_steps = [item for item in steps if str(item.status) == "SUCCEEDED"]
+        if not successful_steps:
+            raise AnalysisContextError("图表必须关联至少一个成功的 AnalysisStep")
+        step = successful_steps[-1]
+        output_name = OutputSpec(name=name, kind=PublicationKind.ARTIFACT).name
+        encoded = json.dumps(
+            spec, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        content_hash = chart_content_hash(spec)
+        target = self._workspace.staging_path(project_id, self._task_id, step.id, output_name)
+        temporary = target.with_name(f".{target.name}.writing")
+        temporary.unlink(missing_ok=True)
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        if self._bridge is None:
+            raise AnalysisContextError("图表发布缺少 WorkspaceBridge")
+        resource_id = self._ids.new("artifact")
+        record = self._bridge.stage(
+            project_id=project_id,
+            task_id=self._task_id,
+            run_id=run_id,
+            step_id=step.id,
+            output_name=output_name,
+            kind=PublicationKind.ARTIFACT,
+            resource_id=resource_id,
+            content_hash=content_hash,
+            byte_size=len(encoded),
+        )
+        published = self._bridge.publish(record.idempotency_key)
+        chart = ChartArtifact(
+            id=ArtifactId(resource_id),
+            project_id=project_id,
+            run_id=run_id,
+            dataset_id=DatasetId(dataset_id),
+            dataset_hash=dataset.content_hash,
+            spec=spec,
+            content_hash=content_hash,
+        )
+        with self._store.unit_of_work() as uow:
+            uow.repo.add_artifact(
+                Artifact(
+                    id=chart.id,
+                    project_id=project_id,
+                    task_id=self._task_id,
+                    run_id=run_id,
+                    name=published.name,
+                    content_hash=published.content_hash,
+                    created_at=self._clock(),
+                )
+            )
+            for source in (
+                ResourceRef(
+                    kind=ResourceKind.DATASET,
+                    resource_id=dataset_id,
+                    content_hash=dataset.content_hash,
+                ),
+                ResourceRef(
+                    kind=ResourceKind.STEP,
+                    resource_id=str(step.id),
+                    content_hash=None,
+                ),
+            ):
+                uow.repo.add_lineage(
+                    Lineage(
+                        id=LineageId(self._ids.new("lineage")),
+                        run_id=run_id,
+                        source=source,
+                        target=ResourceRef(
+                            kind=ResourceKind.ARTIFACT,
+                            resource_id=resource_id,
+                            content_hash=content_hash,
+                        ),
+                        created_at=self._clock(),
+                    )
+                )
+        del snapshot_id
+        return chart
 
     def inspect_output(
         self,
@@ -601,7 +759,7 @@ class AnalysisRuntime:
         ):
             raise AnalysisContextError("输出引用必须是受控 Step 与单个文件名")
         path = self._workspace.staging_path(
-            self._lease.project_id, self._lease.task_id, StepId(step_id), output_name
+            self._project_id, self._task_id, StepId(step_id), output_name
         )
         if not path.is_file():
             raise AnalysisContextError("staging 输出不存在")
@@ -617,7 +775,7 @@ class AnalysisRuntime:
                 record.step_id == StepId(step_id)
                 and record.output_name == output_name
                 and record.status == PublicationStatus.AVAILABLE
-                for record in self._bridge.available(self._lease.project_id)
+                for record in self._bridge.available(self._project_id)
             )
         return OutputInspection(
             step_id=StepId(step_id),
@@ -709,12 +867,12 @@ class AnalysisRuntime:
                             )
                     elif item.kind == EvidenceKind.STEP:
                         step = uow.repo.get_step(StepId(item.target_id)).value
-                        if step.run_id != self._lease.run_id:
+                        if step.run_id != self._run_id:
                             raise AnalysisContextError("Finding Step 证据不属于当前 Run")
                     elif item.kind == EvidenceKind.DATASET:
                         resource = uow.repo.get_dataset(DatasetId(item.target_id))
                         if (
-                            resource.run_id != self._lease.run_id
+                            resource.run_id != self._run_id
                             or resource.content_hash != item.content_hash
                         ):
                             raise AnalysisContextError(
@@ -723,7 +881,7 @@ class AnalysisRuntime:
                     elif item.kind == EvidenceKind.ARTIFACT:
                         resource = uow.repo.get_artifact(ArtifactId(item.target_id))
                         if (
-                            resource.run_id != self._lease.run_id
+                            resource.run_id != self._run_id
                             or resource.content_hash != item.content_hash
                         ):
                             raise AnalysisContextError(
@@ -732,7 +890,7 @@ class AnalysisRuntime:
         except RecordNotFoundError as error:
             raise AnalysisContextError("Finding 证据引用不存在") from error
         candidate = FindingCandidate(
-            task_id=self._lease.task_id,
+            task_id=self._task_id,
             run_id=run_id,
             project_snapshot_id=snapshot_id,
             summary=summary,

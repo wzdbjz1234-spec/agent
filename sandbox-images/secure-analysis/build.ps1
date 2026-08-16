@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Build and record auditable image evidence for secure-analysis.
 

@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 配置系统 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 04 · 配置文件全解</div>
+  <h1>配置系统：从 TOML 到 Pydantic Settings</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/config.py</code>（169 行）和 <code>dataharness.example.toml</code>：配置怎么声明、怎么校验、怎么保护密钥。</p>
+</header>
+<main>
+
+<h2>1. 配置文件长什么样</h2>
+<p>打开 <code>dataharness.example.toml</code>。TOML 是一种简单的键值配置格式：<code>[小节]</code> 分组，<code>键 = 值</code>。本项目的配置结构：</p>
+<pre><code>[paths]
+runtime_data_root = "runtime-data"      # 数据根目录
+
+[model]                                  # 云模型配置
+provider = "deepseek"
+model = "deepseek-v4-flash"
+api_key = ""                             # 真实密钥只填在 dataharness.local.toml
+base_url = "https://api.deepseek.com"
+
+[sandbox]                                # 沙箱配置
+endpoint = "http://127.0.0.1:18080"
+runtime = "secure-analysis"
+network_enabled = false
+
+[extraction]                             # 文件导入限制
+max_file_bytes = 104857600               # 100 MiB
+supported_formats = ["csv", "parquet", "xlsx", "json", "pdf", "docx", "pptx", "md", "txt"]
+
+[index]                                  # 检索调参
+bm25_k1 = 1.2
+bm25_b = 0.75
+max_snippet_chars = 2000
+
+[budget]                                 # Agent 预算
+max_analysis_steps = 50
+max_consecutive_failures = 3
+max_run_duration_seconds = 3600
+
+[resources]                              # 沙箱资源限制
+memory_mb = 1024
+disk_mb = 2048
+max_processes = 32
+max_output_bytes = 10485760
+step_timeout_seconds = 300</code></pre>
+<div class="callout">
+<strong>关键纪律：真实密钥绝不进仓库</strong>
+<p>这个文件是<b>样例</b>。使用时复制为 <code>dataharness.local.toml</code>（已被 <code>.gitignore</code> 忽略）再填密钥（<span class="cite">README.md:87-89</span>）。
+模型 Key 只能出现在本地文件里，不得进入 Runtime DB、Workspace、日志或 API 响应（<span class="cite">README.md:328-331</span>）。</p>
+</div>
+
+<h2>2. Settings 模型：配置即类型</h2>
+<p><code>config.py</code> 用 Pydantic 把配置声明成嵌套模型（<span class="cite">config.py:143-154</span>）：</p>
+<pre><code>class Settings(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    paths: PathsConfig = Field(default_factory=PathsConfig)
+    model: ModelProviderConfig = Field(default_factory=ModelProviderConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
+    index: IndexConfig = Field(default_factory=IndexConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    resources: ResourceLimitsConfig = Field(default_factory=ResourceLimitsConfig)</code></pre>
+<ul>
+<li>七个配置节对应七个 Pydantic 类，一一对应 TOML 的小节。</li>
+<li>所有字段都有<b>默认值</b>（如 <code>paths</code> 默认 <code>runtime-data</code>），所以不写配置文件也能启动。</li>
+<li><code>frozen=True</code>：配置加载后不可修改，防止运行中悄悄被改。</li>
+<li>加载函数用标准库 <code>tomllib</code> 解析（<span class="cite">config.py:157-169</span>），不需要额外依赖：</li>
+</ul>
+<pre><code>def load_settings(path: Path) -> Settings:
+    """从 TOML 文件加载并校验配置。… Raises FileNotFoundError / pydantic.ValidationError"""
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    return Settings.model_validate(data)</code></pre>
+<p>TOML 解析成 dict → <code>model_validate</code> 校验并转换为类型安全的 Settings。配置写错类型、写错枚举值，启动时直接报错，而不是运行时才炸。</p>
+
+<h2>3. 聪明的默认值：路径派生</h2>
+<p>看 <code>PathsConfig</code>（<span class="cite">config.py:19-49</span>）—— 只填一个根目录，其余自动派生：</p>
+<pre><code>@model_validator(mode="before")
+@classmethod
+def _resolve_defaults(cls, data: object) -> object:
+    """缺省子根目录时，从 runtime_data_root 派生。"""
+    # if projects_root missing -> runtime_data_root/projects
+    # if privacy_root  missing -> runtime_data_root/privacy</code></pre>
+<p>派生结果（<span class="cite">README.md:107-112</span>）：</p>
+<pre><code>runtime-data/runtime.db       Runtime SQLite（状态事实源）
+runtime-data/privacy/          每 Task 的 Privacy SQLite（PII 映射）
+runtime-data/projects/         Project Workspace（文件、索引、产物）</code></pre>
+<p><code>@property runtime_db</code>（<span class="cite">config.py:44-48</span>）直接算出 Runtime DB 路径 —— 所有下游组件共享这一个口径。</p>
+
+<h2>4. 安全校验：配置层就 fail closed</h2>
+<p>看 <code>SandboxConfig</code> 的两个关键点（<span class="cite">config.py:67-88</span>）：</p>
+<pre><code>class SandboxConfig(BaseModel):
+    endpoint: str = "http://127.0.0.1:18080"
+    runtime: str = "secure-analysis"
+    image_digest: str | None = None       # 为空表示"待锁定"，创建沙箱前必须锁定
+    network_enabled: bool = False
+    api_key: str | None = None            # repr=False，不进入 repr/日志
+
+    @model_validator(mode="after")
+    def _reject_network(self) -> SandboxConfig:
+        """V1 没有运行期网络开关；即使配置文件显式要求也必须在装配前失败。"""
+        if self.network_enabled:
+            raise ValueError("V1 Sandbox 不允许启用网络")</code></pre>
+<ul>
+<li><code>network_enabled = true</code> 直接启动失败 —— 安全策略在<b>配置加载阶段</b>就强制，而不是等代码运行时才发现。</li>
+<li><code>image_digest</code> 默认 <code>None</code>：没有锁定的镜像 digest 就不允许创建沙箱（第 10 课讲 digest 锁定）。</li>
+<li><code>api_key</code> 的 <code>repr=False</code>：即使有人打印配置对象，密钥也不会显示出来（<span class="cite">config.py:58</span>）。</li>
+</ul>
+
+<h2>5. 预算与限制：防失控的第一道闸</h2>
+<p>两个配置节体现「分层限制」思想（<span class="cite">ARCHITECTURE.md:541-551</span> 第 18 节）：</p>
+<ul>
+<li><code>[budget]</code>（<span class="cite">config.py:120-127</span>）—— DataHarness 自己管的限制：最多 50 个分析步骤、连续失败 3 次熔断、Run 最长 1 小时。</li>
+<li><code>[resources]</code>（<span class="cite">config.py:130-140</span>）—— 沙箱资源限制：内存 1GB、磁盘 2GB、最多 32 进程、输出 10MB、单步 300 秒。</li>
+</ul>
+<p>为什么分两层？因为<b>不同层管不同的失控风险</b>：模型可能疯狂调工具（budget 层管）、生成的代码可能疯狂吃资源（resources 层管）。单靠一层会漏。</p>
+
+<h2>6. CLI 怎么用配置</h2>
+<p>回看 <code>cli.py</code> 的命令（<span class="cite">cli.py:44-68</span>）：</p>
+<pre><code>dataharness check --config dataharness.local.toml    # 校验配置并打印摘要
+dataharness serve --config dataharness.local.toml    # 加载配置并启动 API
+dataharness worker --config dataharness.local.toml   # 加载配置并启动 Worker</code></pre>
+<p><code>check</code> 命令打印的摘要刻意不包含任何密钥（<span class="cite">cli.py:19-32</span>）：</p>
+<pre><code>def _print_settings(settings: Settings) -> None:
+    """打印经过校验的配置摘要（不包含任何密钥）。"""</code></pre>
+<p>它只显示 <code>api_key_configured: True/False</code>（配置了没有），从不显示值本身。</p>
+
+<h2>7. 练习</h2>
+<div class="practice">
+<strong>练习：配置层探索</strong>
+<ol>
+<li>复制样例配置：<code>Copy-Item .\dataharness.example.toml .\dataharness.local.toml</code>，然后运行 <code>uv run dataharness check --config .\dataharness.local.toml</code>，观察输出。</li>
+<li>在 <code>dataharness.local.toml</code> 里把 <code>network_enabled</code> 改成 <code>true</code>，再次运行 <code>check</code> —— 看它如何失败（然后改回来）。</li>
+<li>在 <code>config.py</code> 里找到 <code>repr=False</code> 出现的所有位置，想想每处为什么需要。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：config.py 里 SandboxConfig 拒绝网络的方式是？</h4>
+<div class="options">
+  <button class="option" data-correct="false">启动时检测端口 18080</button>
+  <button class="option" data-correct="false">运行时由沙箱自己拒绝</button>
+  <button class="option" data-correct="true">model_validator 校验：network_enabled=true 直接 ValueError</button>
+  <button class="option" data-correct="false">CLI 里硬编码禁止</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>config.py:77-84</code> 的 <code>_reject_network</code> 用 <code>@model_validator(mode="after")</code>，配置一加载就失败。这符合「fail closed」原则：宁可拒绝启动，也不静默降级。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：为什么 api_key 字段要 repr=False？</h4>
+<div class="options">
+  <button class="option" data-correct="true">防止打印配置对象/日志时把密钥泄漏出去</button>
+  <button class="option" data-correct="false">让 Pydantic 不校验这个字段</button>
+  <button class="option" data-correct="false">让它能存进 Runtime DB</button>
+  <button class="option" data-correct="false">没有实际作用，是习惯</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>repr()</code> 会出现在调试输出、异常信息、日志里。密钥字段带 <code>repr=False</code> 后，即使有人打印 Settings 对象，显示也是 <code>api_key='**********'</code>（Pydantic 自动打码）。这是纵深防御的一环。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="https://docs.pydantic.dev/latest/concepts/validators/">Pydantic 校验器文档</a>（<code>model_validator</code> 的 before/after 区别），
+和 <a href="https://toml.io/cn/v1.0.0">TOML 规范</a>（10 分钟看懂格式）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「mode='before' 和 mode='after' 有什么区别？」「为什么用 TOML 而不是 YAML？」它可以用仓库代码举例解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="03-fastapi-api-layer.html">上一课：FastAPI 入门</a>
+  <a class="next" href="05-domain-models.html">下一课：领域模型与状态机</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 04 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

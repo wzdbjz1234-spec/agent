@@ -666,3 +666,88 @@ SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
 达到这些条件后，DataHarness V1 才可称为：
 
 > A controllable, local-first, sandboxed, long-horizon data analysis agent harness using cloud LLM APIs.
+
+## 23. 本机应用化目标（Plan 1.2）
+
+Phase 00–10 的 V1 验收证明核心 Harness、控制面和安全边界可组合，但当前 `dataharness serve` 尚未装配真实模型、Worker 和用户界面。Plan 1.2 在不改写历史验收事实的前提下增加生产应用闭环，详细决策见 `doc/decision-002-local-agent-application.md`。
+
+目标运行链路：
+
+```text
+WebUI 提交 Project-scoped Session 问题
+ -> API 创建 Task/Run 并固定 ProjectSnapshot
+ -> 独立 Worker 通过 LocalDurableExecutor 领取 Run
+ -> AgentRunHandler 装配 ModelGateway、PydanticAI Agent 与 AnalysisRuntime
+ -> Agent 使用窄工具检索文件，在 OpenSandbox 执行 Python/SQL
+ -> Host 发布 Dataset/Artifact/ChartArtifact/Lineage
+ -> Verification Gate 验证 Finding
+ -> Runtime 事件通过 SSE 投影到 WebUI
+ -> 最终 answer 只引用正式资源和稳定证据
+```
+
+### 23.1 单 Agent 与 Host Harness
+
+- 只保留一个 PydanticAI Agent；不引入 Planner、Executor 或 Reviewer Agent。
+- Agent 负责问题理解和工具选择；Host 负责 Task/Run 状态、预算、checkpoint、发布、验证、错误分类和恢复。
+- 首个生产模型 Adapter 使用 OpenAI-compatible 协议，但模型请求、响应、摘要和 compaction 仍必须经过 ModelGateway。
+- Agent 在预算内自主执行；歧义、输入缺失、策略阻断、预算耗尽或越界请求必须进入带稳定原因的 WAITING。
+
+### 23.2 Session 与上下文
+
+- Session 固定属于单一 Project，每条用户消息创建一个 Task，每个 Task 固定独立 ProjectSnapshot。
+- 当前消息、结构化 goal/plan/progress、稳定领域引用和长期历史分层保存；ProjectCorpus 事实不得复制为对话记忆。
+- 历史检索必须同时受 Project 与 Session 约束，不允许跨 Project 命中。
+- checkpoint 在关键 AnalysisStep、发布、验证、WAITING、完成和 compaction 边界保存；摘要不是事实来源。
+
+### 23.3 事件接口
+
+- 用户操作使用普通 HTTP，任务状态使用 SSE；不引入 WebSocket。
+- SSE 事件来自 Runtime SQLite 的有序事件事实，支持按最后事件序号断线补发。
+- 事件可披露工具名称、稳定 ID、状态、耗时、大小和脱敏摘要，不披露隐藏思考过程、凭据、PII 原值或无界 stdout/stderr。
+
+## 24. 本机 WebUI
+
+WebUI 使用 React、TypeScript、Vite、Ant Design、TanStack Query、React Router 和 Vega-Lite。开发期使用 Vite；发布时由 FastAPI 在回环地址同源托管预构建资源。
+
+MVP 页面限定为：
+
+```text
+/projects
+/projects/{project_id}
+/projects/{project_id}/sessions/{session_id}
+/tasks/{task_id}
+```
+
+页面覆盖 Project、文件版本、Session 对话、Task 进度、Dataset、Artifact、Finding、证据、lineage 和最终回答。诊断抽屉只显示 Docker、OpenSandbox、Worker、模型配置、镜像和数据目录状态，不读取或回显 API Key。
+
+### 24.1 图表安全边界
+
+- Agent 输出 Dataset 引用和声明式 Vega-Lite JSON，不输出可执行 HTML 或 JavaScript。
+- Host 在发布前校验 schema、Dataset ID/hash、大小、变换和外部数据源；前端只渲染通过 Gate 的正式 ChartArtifact。
+- 禁止外部 URL、iframe、任意函数和未发布数据引用。
+- PNG/SVG Artifact 作为失败兜底、报告导出和长期复现格式。
+
+## 25. 本机部署拓扑
+
+个人版要求 Docker Desktop 和 uv，通过脚本管理三个独立宿主进程：
+
+```text
+start.bat（启动器；引擎为 start.ps1）
+  |- OpenSandbox Server :18080
+  |- DataHarness API    :8000（同源托管 WebUI）
+  `- DataHarness Worker      （按需创建 Sandbox 容器）
+```
+
+- `setup.bat`、`start.bat`、`stop.bat`、`status.bat` 是薄启动器，负责定位 pwsh 并调用等价的
+  `setup.ps1`、`start.ps1`、`stop.ps1`、`status.ps1` 引擎脚本；`setup.ps1` 负责依赖、配置、
+  镜像和端口预检，`start.ps1`、`stop.ps1`、`status.ps1` 负责幂等进程生命周期与诊断。
+- Docker 只运行 Sandbox、execd 和 egress；API 与 Worker 不因个人版本而强制容器化。
+- PID、日志、配置和运行数据使用明确目录；停止或卸载默认不删除用户数据。
+- API Key 只从未纳入版本控制的本地 TOML 配置读取，不进入仓库、Workspace、日志、前端或 Sandbox。
+- 最终用户不需要 Node.js；前端静态构建随发布包交付。
+
+## 26. 团队版迁移边界
+
+后续团队内部平台必须重新建立共享环境威胁模型，并补齐认证、RBAC、租户隔离、TLS、CSRF/CORS、密钥管理、配额、审计和高可用。个人版的回环地址、单用户文件权限、SQLite 和本地 TOML 密钥假设不得直接沿用。
+
+迁移时保持 Domain、AgentRunHandler、API DTO 和 WebUI 稳定，通过 Adapter 逐步替换 Runtime SQLite、LocalWorkspace、本机 Worker 和脚本进程管理。候选目标为 PostgreSQL、对象存储、耐久队列、独立容器镜像和反向代理；这些在 Phase 14 完成前均不是已实现能力。

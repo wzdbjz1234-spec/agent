@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 模型网关与隐私 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 09 · 全项目最值得读的部分</div>
+  <h1>模型出口与隐私边界：ModelGateway</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/privacy/</code>：所有发给云模型的内容如何被检查、阻断、替换。这是「云模型驱动本地数据」的信任基石。</p>
+</header>
+<main>
+
+<h2>1. 问题的本质</h2>
+<p>DataHarness 的承诺（<span class="cite">ARCHITECTURE.md:13-15</span>）：</p>
+<blockquote>
+通过本地持久化、隔离执行、统一模型出口和敏感信息误传防护，使云端 LLM 能够可控地驱动本地数据分析。
+</blockquote>
+<p>注意它<b>不承诺</b>「业务数据绝不离开本地」—— 业务数据允许发给用户选择的云模型。它只承诺两件事：</p>
+<ol>
+<li><b>凭据（密码/Key/Token/连接串）绝不发给模型</b> —— 发现即阻断整个请求；</li>
+<li><b>常见 PII（邮箱/手机/银行卡/身份证）在云端视图中被替换成占位符</b> —— 本地数据不动，模型看到的是假值，工具调用回来时再恢复。</li>
+</ol>
+
+<h2>2. 唯一出口：ModelGateway</h2>
+<p>铁律（<span class="cite">ARCHITECTURE.md:347-349</span>）：<b>主 Agent、Compaction、摘要器、Skill 选择器以及未来所有辅助模型调用，全部必须经过 ModelGateway</b>。业务模块禁止直接调用模型 SDK。</p>
+<p><code>ModelGateway.complete</code>（<span class="cite">privacy/gateway.py:36-48</span>）是唯一入口：</p>
+<pre><code>def complete(self, task_id: TaskId, request: str) -> PreparedRequest:
+    """在 Provider 调用前阻断 secret、占位 PII，且再次脱敏模型回复。"""
+    prepared = self._policy.prepare_request(task_id, request)     # ① 出境前检查
+    try:
+        response = self._provider.complete(prepared.cloud_text)  # ② 只有脱敏文本发出
+    except ModelProviderError:
+        raise                                             # 稳定分类错误原样抛
+    except Exception as error:
+        safe = self._policy.sanitize_boundary_text(task_id, str(error), BoundaryKind.EXCEPTION)
+        raise ModelProviderError(safe.cloud_text) from error
+    return self._policy.sanitize_boundary_text(task_id, response, BoundaryKind.RESPONSE)  # ③ 回程再脱敏</code></pre>
+<p>三段式：<b>出境前检查 → 只发送脱敏文本 → 入境（响应、甚至异常文本）再脱敏</b>。模型回复里可能包含用户 PII（比如「你刚刚发我的邮箱是…」），所以回程也要处理。</p>
+
+<h2>3. 出境检查：PrivacyPolicy.prepare_request</h2>
+<p><span class="cite">privacy/policy.py:90-95</span>：</p>
+<pre><code>def prepare_request(self, task_id: TaskId, text: str) -> PreparedRequest:
+    """扫描新增请求；凭据 fail closed，PII 转为该 Task 专属的云端视图。"""
+    entry = self._scan(task_id, text)
+    if entry.secrets:
+        raise SecretDetectedError(entry.secrets)          # 有凭据 → 整个请求报废
+    return PreparedRequest(self._store.mask(task_id, text, entry.pii), self._audit(text, entry))</code></pre>
+<ul>
+<li><b>发现凭据 → 抛 <code>SecretDetectedError</code></b>，请求根本不会发出。消息只含凭据类型清单（<span class="cite">policy.py:14-20</span>），不含原文。</li>
+<li><b>PII → <code>mask()</code> 替换成占位符</b>，同时产出审计元数据（<code>PrivacyAudit</code>：只有 hash 和种类计数，无明文，<span class="cite">policy.py:34-42</span>）。</li>
+</ul>
+
+<h2>4. 检测器：两种不同的扫描</h2>
+<h3>4.1 SecretDetector —— 阻断型（<span class="cite">detector.py:64-114</span>）</h3>
+<p>保守的正则规则表（<span class="cite">detector.py:71-104</span>），识别 5 类：</p>
+<table>
+<thead><tr><th>类型</th><th>示例特征</th></tr></thead>
+<tbody>
+<tr><td>PRIVATE_KEY</td><td>PEM 私钥块（<code>-----BEGIN ... PRIVATE KEY-----</code>）</td></tr>
+<tr><td>CONNECTION_STRING</td><td><code>postgres://</code>、<code>mysql://</code>、<code>redis://</code> 等连接串</td></tr>
+<tr><td>PASSWORD</td><td><code>password = xxx</code> 赋值模式</td></tr>
+<tr><td>API_TOKEN</td><td><code>api_key=</code>、<code>sk-...</code>、<code>ghp_...</code>、<code>AKIA...</code> 等</td></tr>
+<tr><td>COOKIE</td><td><code>set-cookie:</code> / <code>cookie:</code> 头</td></tr>
+</tbody>
+</table>
+<p>扫描结果是不重叠的 <code>SensitiveMatch(kind, start, end)</code> 位置对 —— <b>代码不返回明文</b>，只返回位置与类型（<span class="cite">detector.py:106-114</span>）。</p>
+<h3>4.2 PIIDetector —— 替换型（<span class="cite">detector.py:128-170</span>）</h3>
+<p>识别邮箱、手机号（中/美）、银行卡（用 Luhn 算法校验真实性，<span class="cite">detector.py:117-125</span>）、18 位身份证，还支持构造时注入自定义规则（<code>CustomPIIRule</code>，<span class="cite">detector.py:49-52</span>）。</p>
+<div class="callout">
+<strong>为什么默认不识别姓名、地址这类 NER 型 PII？</strong>
+<p>因为「尽力而为」的分类可能误伤业务数据（<span class="cite">ARCHITECTURE.md:363-364</span>）。V1 只做可确定性验证的边界（<span class="cite">ARCHITECTURE.md:86</span>）：类型化、可逆、可测试的规则。</p>
+</div>
+
+<h2>5. 占位符：可逆的云端视图</h2>
+<p>替换在 <code>PlaceholderStore.mask</code>（<span class="cite">privacy/placeholders.py:144-158</span>）：</p>
+<pre><code># 每个值被替换成：&lt;PII:{种类}:{序号}&gt;，例如 &lt;PII:EMAIL:0001&gt;
+placeholder = f"&lt;PII:{kind}:{sequence:04d}&gt;"</code></pre>
+<p>关键语义（<span class="cite">ARCHITECTURE.md:367-373</span>）：</p>
+<ul>
+<li><b>只在云端视图里改</b>：本地 Dataset、Workspace 原样不动。</li>
+<li><b>Task 内稳定</b>：同一 Task 内同一值（规范化后）用同一个占位符 —— 模型才能理解「&lt;PII:EMAIL:0001&gt; 就是那个邮箱」；不同 Task 的映射互相独立，无法关联。</li>
+<li>规范化（邮箱小写、数字去格式）后查表复用（<span class="cite">placeholders.py:99-106</span>）。</li>
+</ul>
+<p>映射存在哪？每 Task 一个独立 SQLite：<code>runtime-data/privacy/{task_id}.db</code>，表结构（<span class="cite">placeholders.py:41-59</span>）：</p>
+<pre><code>CREATE TABLE IF NOT EXISTS pii_mappings (
+    placeholder TEXT PRIMARY KEY,
+    pii_kind TEXT NOT NULL,
+    normalized_hash TEXT NOT NULL,
+    original_value TEXT NOT NULL,
+    UNIQUE(pii_kind, normalized_hash));
+CREATE TABLE IF NOT EXISTS scan_cache (...);</code></pre>
+<p>这个数据库的纪律（<span class="cite">ARCHITECTURE.md:375-381</span>）：<b>不进 Workspace、不进沙箱、不进 Runtime DB、不进日志、不进 Artifact</b>。它是与 Runtime DB 物理分离的第三个库。</p>
+
+<h2>6. 恢复：只在沙箱工具调用前</h2>
+<p>模型写代码时引用 <code>&lt;PII:EMAIL:0001&gt;</code>，执行前要还原成真邮箱。但<b>不是无脑还原</b>——<code>restore_tool_input</code>（<span class="cite">policy.py:113-117</span>）：</p>
+<ul>
+<li>只允许当前 Task 已登记的占位符；</li>
+<li>只允许 <code>allowed_kinds</code> 白名单内的类型（<span class="cite">placeholders.py:160-181</span>）；</li>
+<li>占位符未登记或类型不符 → <code>PlaceholderRestoreError</code>，拒绝执行。</li>
+</ul>
+<p>为什么有白名单？防止模型「骗」系统恢复它不该用的类型（比如拿 EMAIL 占位符去套银行卡映射）。恢复后的代码才进入沙箱 —— 所以沙箱里执行的是真实数据，而模型永远只见过占位符。</p>
+
+<h2>7. 扫描缓存：内容寻址加速</h2>
+<p>每段文本都跑一遍正则会很慢。项目用<b>内容 hash 缓存</b>：<code>scan_cache</code> 以文本 SHA-256 为键缓存检测结果（<span class="cite">placeholders.py:72-97</span>），<code>PrivacyPolicy._scan</code>（<span class="cite">policy.py:71-78</span>）先查缓存。相同内容只扫一次 —— 和文件版本的 hash 思想一脉相承。</p>
+
+<h2>8. 审计：没有明文的元数据</h2>
+<p>每次出境的审计记录（<code>PrivacyAudit</code>，<span class="cite">policy.py:34-42</span>）只有：内容 hash、PII 种类与数量、secret 种类与数量。可观测性（OTel）也遵循同一纪律：<code>message</code> 属性必须经过 <code>gateway.sanitize_trace</code> 才允许记录（<span class="cite">providers/observability/otel.py:138-154</span>）。</p>
+
+<h2>9. 练习</h2>
+<div class="practice">
+<strong>练习：看检测器怎么工作</strong>
+<ol>
+<li>在 <code>privacy/detector.py</code> 里找出银行卡的 Luhn 校验函数（<code>_luhn_valid</code>），用几个真实卡号格式试推它的逻辑。</li>
+<li>读 <code>privacy/placeholders.py</code> 的 <code>mask</code>，确认「同一 Task 内相同规范化值 → 同一占位符」的查表路径。</li>
+<li>在 <code>worker.py:135-142</code> 找到 ModelGateway 的装配代码，复述三个组件的连接关系。</li>
+<li>思考：模型回复里出现用户邮箱时，<code>sanitize_boundary_text</code> 会把它换成什么？它会被登记到映射表吗？读 <span class="cite">policy.py:97-111</span> 验证你的答案。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：请求里发现 API Key 时会发生什么？</h4>
+<div class="options">
+  <button class="option" data-correct="false">替换成占位符后照常发送</button>
+  <button class="option" data-correct="false">警告后继续发送</button>
+  <button class="option" data-correct="true">整个请求被阻断，抛 SecretDetectedError</button>
+  <button class="option" data-correct="false">把 Key 记进日志再发送</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+凭据 fail closed（<span class="cite">policy.py:90-95</span>）：发现即抛错，模型根本收不到请求。错误消息只有类型清单（如「API_TOKEN」），没有原文。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：PII 占位符的映射存在哪里？</h4>
+<div class="options">
+  <button class="option" data-correct="false">Runtime SQLite</button>
+  <button class="option" data-correct="true">每 Task 独立的 Privacy SQLite（runtime-data/privacy/{task_id}.db）</button>
+  <button class="option" data-correct="false">沙箱容器的内存里</button>
+  <button class="option" data-correct="false">浏览器 localStorage</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+映射明文只存在于 Privacy DB（<span class="cite">ARCHITECTURE.md:375-381</span>）。Runtime DB、Workspace、沙箱、日志、Trace 一律不碰它 —— 三层存储物理分离。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 10 节「ModelGateway 与隐私占位」全文（<span class="cite">ARCHITECTURE.md:345-381</span>），
+和 <a href="https://github.com/microsoft/presidio">Microsoft Presidio</a>（项目参考的 PII 检测器，看它如何组织规则）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「为什么错误消息也只给类型不给位置？」「scan_cache 的键是什么 hash？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="08-agent-basics.html">上一课：Agent 基础</a>
+  <a class="next" href="10-sandbox-execution.html">下一课：沙箱执行</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 09 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

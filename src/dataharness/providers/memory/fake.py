@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from dataharness.domain import ContentHash, ResourceRef, RunId, TaskId, compute_content_hash
+from dataharness.domain import (
+    ContentHash,
+    ProjectId,
+    ResourceRef,
+    RunId,
+    SessionId,
+    TaskId,
+    compute_content_hash,
+)
 
 from .sqlite import HistoryEntry, HistoryHit
 
@@ -20,6 +28,8 @@ class FakeHistoryStore:
         *,
         task_id: TaskId,
         run_id: RunId,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
         text: str,
         references: tuple[ResourceRef, ...] = (),
         created_at: datetime,
@@ -33,6 +43,8 @@ class FakeHistoryStore:
             id=entry_id,
             task_id=task_id,
             run_id=run_id,
+            project_id=project_id,
+            session_id=session_id,
             text=text,
             content_hash=ContentHash(compute_content_hash(text.encode())),
             references=references,
@@ -41,7 +53,14 @@ class FakeHistoryStore:
         self.entries.append(entry)
         return entry
 
-    def search(self, query: str, *, limit: int = 20) -> tuple[HistoryHit, ...]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        project_id: ProjectId | None = None,
+        session_id: SessionId | None = None,
+    ) -> tuple[HistoryHit, ...]:
         """使用简单词项匹配模拟 FTS5 返回形状，保持测试不依赖私有 SQL。"""
         terms = tuple(query.casefold().split())
         if not terms:
@@ -52,6 +71,8 @@ class FakeHistoryStore:
                 score=-float(sum(term in entry.text.casefold() for term in terms)),
             )
             for entry in self.entries
+            if (project_id is None or entry.project_id == project_id)
+            and (session_id is None or entry.session_id == session_id)
             if all(term in entry.text.casefold() for term in terms)
         ]
         return tuple(sorted(hits, key=lambda item: item.score)[:limit])

@@ -2,7 +2,8 @@
 
 定义 DataHarness 运行所需的全部可配置项并用 Pydantic 校验。配置来源为 TOML 文件
 （使用 Python 3.12 内置 :mod:`tomllib` 解析，不引入额外解析依赖）。默认值不包含
-任何真实凭据，也不依赖公网；API 密钥仅以环境变量名引用，绝不写入配置文件。
+任何真实凭据，也不依赖公网；本地密钥只从未纳入版本控制的 ``dataharness.local.toml``
+读取，绝不进入日志、Runtime DB 或 API 响应。
 
 默认情况下 FastAPI 只监听 ``127.0.0.1``，本模块不配置任何公网暴露项。
 """
@@ -51,14 +52,14 @@ class PathsConfig(BaseModel):
 class ModelProviderConfig(BaseModel):
     """云模型 Provider 配置。
 
-    ``api_key_env`` 只记录环境变量名；实际密钥由运行时从环境读取，不进入配置或日志。
+    ``api_key`` 只用于本地配置文件；诊断、日志和持久化业务数据都不暴露它。
     """
 
     model_config = ConfigDict(frozen=True)
 
     provider: str = "openai"
     model: str = "gpt-4o-mini"
-    api_key_env: str = "DATAHARNESS_MODEL_API_KEY"
+    api_key: str | None = Field(default=None, repr=False)
     base_url: str | None = None
     timeout_seconds: float = 120.0
 
@@ -72,7 +73,7 @@ class SandboxConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    endpoint: str = "http://127.0.0.1:8080"
+    endpoint: str = "http://127.0.0.1:18080"
     runtime: str = "secure-analysis"
     image_digest: str | None = None
     network_enabled: bool = False

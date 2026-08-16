@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 验证门与血缘 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 12 · 让模型结论可信</div>
+  <h1>验证门与血缘：结论如何被证明</h1>
+  <p class="subtitle">本课解剖 <code>analysis/verification.py</code> 与 <code>domain/finding.py</code>、<code>domain/lineage.py</code>：Agent 提交的结论凭什么可信？答案：必须过三个 Host 验证门，并且每条结论都有可追溯的血缘链。</p>
+</header>
+<main>
+
+<h2>1. 问题的本质：模型不能自证</h2>
+<p>LLM 会一本正经地胡说八道。所以项目的规则是（<span class="cite">ARCHITECTURE.md:536-539</span>）：</p>
+<blockquote>
+每个最终 Finding 是结构化对象；至少引用一个属于当前 ProjectSnapshot 与 Task/Run 的有效证据；
+证据可追溯到文件的页码/段落/工作表/行范围，或 AnalysisStep、输入 Dataset、代码、Artifact；内容 hash 未变化。
+</blockquote>
+<p>结论（Finding）由 Agent 提出，<b>由 Host 验证</b>。第 05 课讲过 <code>FindingCandidate</code> → <code>Finding</code> 的两阶段；本课看验证怎么做。</p>
+
+<h2>2. 三个 Gate</h2>
+<p><code>VerificationService.verify</code>（<span class="cite">analysis/verification.py:290-346</span>）对每个 DRAFT Finding 依次跑三个门：</p>
+<pre><code>execution_reports = tuple(self._execution.check(item) for item in summaries_tuple)   # ① 执行门
+integrity_reports = tuple(self._integrity.check(run, item) for item in summaries_tuple)  # ② 完整性门
+reports = (*execution_reports, *integrity_reports, self._evidence.check(finding))    # ③ 证据门
+failed = any(not report.passed for report in reports)
+if failed:
+    updated = finding.reject(); event = "FINDING_REJECTED"        # 任何一门不过 → 拒绝
+elif warnings:
+    updated = finding.mark_warning(); event = "FINDING_WARNING"   # 有数据质量警告 → WARNING
+else:
+    updated = finding.verify(); event = "FINDING_VERIFIED"        # 全过 → 正式结论</code></pre>
+
+<h3>ExecutionGate：执行过程正常吗（<span class="cite">verification.py:72-86</span>）</h3>
+<ul>
+<li>引用的 AnalysisStep 状态是 SUCCEEDED；</li>
+<li>退出码正常；</li>
+<li>输出元数据完整（没有超时/取消/资源耗尽）。</li>
+</ul>
+<h3>IntegrityGate：数据没被动过（<span class="cite">verification.py:89-172</span>）</h3>
+<ul>
+<li>从数据库重新读 Run/Snapshot/Step，重新验证输入文件 hash（重新打开原件比对）；</li>
+<li>对发布产物重新计算 hash，与注册记录比对大小与 hash；</li>
+<li>简单说：<b>所有 hash 从头再算一遍</b>，任何不一致 = CORRUPT。</li>
+</ul>
+<h3>EvidenceGate：结论有证据吗（<span class="cite">verification.py:175-272</span>）</h3>
+<ul>
+<li>Finding 的 Task/Run/Snapshot 归属正确；</li>
+<li>每条证据（FILE/STEP/DATASET/ARTIFACT，<span class="cite">domain/finding.py:22-28</span>）在数据库中真实存在、hash 匹配；</li>
+<li>覆盖报告的快照一致；覆盖缺口变成<b>披露（notice）</b>而不是拒绝 —— 诚实披露缺口（<span class="cite">verification.py:324-345</span> 的事件 <code>FINDING_COVERAGE_NOTICE</code>）。</li>
+</ul>
+
+<h2>3. 数据质量警告：不阻断但披露</h2>
+<p><code>DataWarningDetector</code>（<span class="cite">analysis/warnings.py</span>）从沙箱统计信息检测 5 类数据问题：行数异常变化、Join 膨胀、缺失值、类型转换失败、重复值（<span class="cite">ARCHITECTURE.md:539</span>）。检测到 → Finding 标 WARNING（不拒绝），事件 <code>FINDING_DATA_WARNINGS</code> 会变成 API 回答里的 <code>disclosures</code>（<span class="cite">api/services.py:400-409</span>）。</p>
+<div class="callout">
+<strong>为什么不把警告也变成拒绝？</strong>
+<p>因为「数据本身有质量问题」≠「分析结论错」。系统诚实标注「此结论基于有缺失值的数据」，把判断权交给用户 —— 而不是假装自己是统计裁判（<span class="cite">ARCHITECTURE.md:539</span>）。</p>
+</div>
+
+<h2>4. 血缘：每个产物从哪来</h2>
+<p>发布 Dataset/Artifact 时，<code>AnalysisRuntime</code> 同时写血缘记录（<span class="cite">analysis/runtime.py:335-377</span>）：</p>
+<pre><code># 输入文件版本 → 输出 Dataset 的血缘边
+Lineage(run_id=..., source=ResourceRef(kind=ResourceKind.FILE_VERSION, resource_id=..., content_hash=...),
+        target=ResourceRef(kind=ResourceKind.DATASET, resource_id=..., content_hash=...), created_at=...)
+# 执行 Step（带代码 hash）→ 输出
+Lineage(run_id=..., source=ResourceRef(kind=ResourceKind.STEP, resource_id=...), target=...)</code></pre>
+<p>资源类型共 5 种（<span class="cite">domain/lineage.py:17-24</span>）：FILE_VERSION / STEP / DATASET / ARTIFACT / FINDING。血缘边用<b>稳定 ID + hash</b>，绝不用原始路径（<span class="cite">domain/lineage.py:37-46</span>）。查询：<code>GET /tasks/{id}/lineage</code>（<span class="cite">api/app.py:325</span>）。</p>
+<p>有了血缘，就能回答「这个图表是哪些文件、哪段代码算出来的」—— 这是审计与复现的基础。</p>
+
+<h2>5. 回答的披露：disclosures 字段</h2>
+<p>最终回答 <code>TaskAnswer</code>（<span class="cite">api/models.py:58-76</span>）有一个特别字段 <code>disclosures</code>：来自覆盖缺口与数据质量事件，让客户端能区分「正常结论」和「需要人工复核」。第 13 课你会真的看到它。</p>
+
+<h2>6. 练习</h2>
+<div class="practice">
+<strong>练习：追一条证据链</strong>
+<ol>
+<li>打开 <code>domain/finding.py</code> 的 <code>EvidenceRef</code>（31-40 行），列出它的四个字段，说出每个字段在 EvidenceGate 里被怎么用。</li>
+<li>读 <code>analysis/verification.py</code> 的 <code>IntegrityGate.check</code>（89-172 行），找出它「重新打开文件比对 hash」的代码位置（用到 corpus 的哪个方法？）。</li>
+<li>打开 <code>analysis/warnings.py</code>，数出 5 类警告种类，并说明它们的数据来源（沙箱的什么输出？）。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：Agent 提交的 Finding 缺证据，最终状态是？</h4>
+<div class="options">
+  <button class="option" data-correct="false">VERIFIED（因为没有失败）</button>
+  <button class="option" data-correct="true">REJECTED（EvidenceGate 不过）</button>
+  <button class="option" data-correct="false">WARNING</button>
+  <button class="option" data-correct="false">DRAFT（保留原样）</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>EvidenceRef</code> 要求非空证据（构造时校验，<span class="cite">domain/finding.py:56-61</span>），且 EvidenceGate 会逐条核验（<span class="cite">verification.py:175-272</span>）。任何一门失败 → <code>finding.reject()</code>，DRAFT 直接变 REJECTED（<span class="cite">verification.py:302-304</span>）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：完整性门（IntegrityGate）在验证什么？</h4>
+<div class="options">
+  <button class="option" data-correct="false">模型回答是否通顺</button>
+  <button class="option" data-correct="true">输入文件、代码、产物的 hash 全部重新校验，没被篡改</button>
+  <button class="option" data-correct="false">沙箱是否断网</button>
+  <button class="option" data-correct="false">用户是否已付款</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+IntegrityGate（<span class="cite">verification.py:89-172</span>）是「内容寻址」的应用：结论依赖的每一样东西的 hash 与注册值一致，保证「你看到的证据就是分析时的证据」。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 16-17 节「输出发布与崩溃对账」「Verification V1」（<span class="cite">ARCHITECTURE.md:499-539</span>），
+和 <a href="https://openlineage.io/">OpenLineage</a>（项目血缘设计参考的开源标准）。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「FINDING_COVERAGE_NOTICE 事件在哪里被消费？」「为什么血缘不用路径而用 ID+hash？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="11-durable-execution.html">上一课：耐久编排</a>
+  <a class="next" href="13-end-to-end.html">下一课：端到端实操</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 12 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

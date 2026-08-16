@@ -19,7 +19,11 @@ class CloudModelProvider(Protocol):
 
 
 class ModelProviderError(RuntimeError):
-    """Provider 失败后的安全错误；消息已经过统一再扫描。"""
+    """Provider 失败后的稳定错误；消息只包含分类，不包含请求、响应或密钥。"""
+
+    def __init__(self, message: str, *, code: str = "MODEL_PROVIDER_ERROR") -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class ModelGateway:
@@ -34,6 +38,10 @@ class ModelGateway:
         prepared = self._policy.prepare_request(task_id, request)
         try:
             response = self._provider.complete(prepared.cloud_text)
+        except ModelProviderError:
+            # 生产 Provider 已经把 HTTP 状态、配置缺失和响应损坏映射成稳定分类；
+            # 这里不能再把底层异常正文包装回调用方。
+            raise
         except Exception as error:
             safe = self._policy.sanitize_boundary_text(task_id, str(error), BoundaryKind.EXCEPTION)
             raise ModelProviderError(safe.cloud_text) from error

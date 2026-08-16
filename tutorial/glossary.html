@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>术语表 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">DataHarness 教程 · 参考文档</div>
+  <h1>术语表</h1>
+  <p class="subtitle">全课程统一使用的词汇与缩写。遇到不认识的词先查这里。</p>
+</header>
+<main>
+
+<h2>核心概念</h2>
+<table>
+<thead><tr><th>术语</th><th>含义</th><th>在本项目中的位置</th></tr></thead>
+<tbody>
+<tr><td><b>DataHarness</b></td><td>本项目名：本地优先、云端 LLM 驱动、沙箱隔离执行的数据分析 Agent Harness</td><td>仓库根目录</td></tr>
+<tr><td><b>Harness</b></td><td>「马具」——一种装配、约束和编排第三方组件的框架层，不自己实现通用基础设施</td><td>自研 Domain/编排，复用 PydanticAI/OpenSandbox</td></tr>
+<tr><td><b>Project</b></td><td>长期容器，装一个分析项目的全部文件版本与正式产物</td><td><code>domain/project.py</code></td></tr>
+<tr><td><b>ProjectFile / ProjectFileVersion</b></td><td>逻辑文件 / 不可变文件版本（同名字重复导入生成新版本）</td><td><code>domain/project.py</code></td></tr>
+<tr><td><b>ProjectSnapshot</b></td><td>创建时固定的文件版本清单，Run 的只读输入视图，创建后不可变</td><td><code>domain/project.py</code></td></tr>
+<tr><td><b>Session</b></td><td>绑定单一 Project 的对话上下文；每条用户消息创建一个 Task</td><td><code>domain/session.py</code></td></tr>
+<tr><td><b>Task</b></td><td>一次用户请求对应的分析任务，必须绑定一个 Project</td><td><code>domain/task.py</code></td></tr>
+<tr><td><b>Run</b></td><td>Task 的一次执行尝试；终态 Run 永不重开，重试创建新 Run</td><td><code>domain/run.py</code></td></tr>
+<tr><td><b>AnalysisStep</b></td><td>一次独立的代码/SQL 执行，失败后重试创建新 Step</td><td><code>domain/step.py</code></td></tr>
+<tr><td><b>Finding</b></td><td>Agent 提交的候选结论（FindingCandidate），由 Host 验证门提升为正式 Finding</td><td><code>domain/finding.py</code></td></tr>
+<tr><td><b>Dataset / Artifact</b></td><td>正式发布的派生数据 / 展示产物（图表等），发布后不可变</td><td><code>domain/artifact.py</code></td></tr>
+<tr><td><b>Lineage</b></td><td>血缘：资源之间的 source→target 引用边（含 hash）</td><td><code>domain/lineage.py</code></td></tr>
+<tr><td><b>Snapshot</b>（目录层）</td><td>沙箱内只读挂载的 <code>/project</code> 视图</td><td><code>worker.py</code> 挂载解析</td></tr>
+</tbody>
+</table>
+
+<h2>状态枚举</h2>
+<table>
+<thead><tr><th>枚举</th><th>取值</th></tr></thead>
+<tbody>
+<tr><td><code>TaskStatus</code></td><td>QUEUED / ACTIVE / WAITING / COMPLETED / FAILED / CANCELLED</td></tr>
+<tr><td><code>RunStatus</code></td><td>QUEUED / RUNNING / WAITING / SUCCEEDED / FAILED / CANCELLED</td></tr>
+<tr><td><code>RunPhase</code></td><td>PREPARING → REASONING → EXECUTING → VERIFYING → FINALIZING（只前进）</td></tr>
+<tr><td><code>StepStatus</code></td><td>PENDING / RUNNING / SUCCEEDED / FAILED / TIMED_OUT / CANCELLED</td></tr>
+<tr><td><code>WaitReason</code></td><td>USER_INPUT / BUDGET_EXHAUSTED / RETRY_APPROVAL / MISSING_DEPENDENCY</td></tr>
+<tr><td><code>FileVersionStatus</code></td><td>IMPORTING / READY / FAILED / UNSUPPORTED</td></tr>
+<tr><td><code>ProjectStatus</code></td><td>ACTIVE / ARCHIVED</td></tr>
+<tr><td><code>FindingStatus</code></td><td>DRAFT / VERIFIED / WARNING / REJECTED</td></tr>
+<tr><td><code>PublicationStatus</code></td><td>STAGED / AVAILABLE / CORRUPT</td></tr>
+</tbody>
+</table>
+
+<h2>架构与安全</h2>
+<table>
+<thead><tr><th>术语</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><b>Host</b>（可信侧）</td><td>运行 DataHarness 的本机进程：FastAPI、Worker、Runtime SQLite、隐私映射</td></tr>
+<tr><td><b>Sandbox</b>（不可信侧）</td><td>执行 LLM 生成代码的隔离容器，默认断网、只读挂载 Snapshot</td></tr>
+<tr><td><b>Runtime SQLite</b></td><td>Task/Run/Step 状态、事件、队列、lease 的事实来源（<code>runtime-data/runtime.db</code>）</td></tr>
+<tr><td><b>Privacy SQLite</b></td><td>每 Task 独立的 PII 占位映射库（<code>runtime-data/privacy/{task_id}.db</code>）</td></tr>
+<tr><td><b>ModelGateway</b></td><td>所有云模型请求的唯一出口：凭据阻断 + PII 占位 + 审计</td></tr>
+<tr><td><b>PlaceholderStore</b></td><td>PII 占位符与原文的映射存储（仅存于 Privacy SQLite）</td></tr>
+<tr><td><b>Lease / lease_epoch</b></td><td>Worker 领取 Run 后持有的「租约」；epoch 是防呆令牌（fencing token）</td></tr>
+<tr><td><b>CAS</b></td><td>Compare-And-Swap：按 row_version 条件更新，并发冲突即失败</td></tr>
+<tr><td><b>Attestation</b></td><td>创建/重连沙箱后用运行时探测核验实际配置（digest/网络/权限/挂载），不符即 fail closed</td></tr>
+<tr><td><b>digest 锁定</b></td><td>镜像引用必须是 <code>name@sha256:64位hex</code>，禁止 <code>latest</code> 标签</td></tr>
+<tr><td><b>fail closed</b></td><td>条件不满足时宁可失败，也不静默降级</td></tr>
+<tr><td><b>Checkpoint</b></td><td>Agent 消息历史与状态的持久化快照（Workspace 文件 + Runtime 元数据）</td></tr>
+<tr><td><b>Compaction</b></td><td>上下文超预算时用模型总结压缩历史</td></tr>
+<tr><td><b>Verification Gate</b></td><td>ExecutionGate / IntegrityGate / EvidenceGate 三个 Host 验证门</td></tr>
+<tr><td><b>FTS5 / BM25</b></td><td>SQLite 全文检索虚拟表 / 相关度排序算法</td></tr>
+<tr><td><b>SSE</b></td><td>Server-Sent Events：服务器单向推送事件流（<code>/tasks/{id}/events/stream</code>）</td></tr>
+<tr><td><b>UoW</b></td><td>UnitOfWork：一个事务包裹多个仓储操作，全部成功或全部回滚</td></tr>
+<tr><td><b>PydanticAI</b></td><td>本项目使用的 Agent 框架（工具调用、结构化输出、UsageLimits）</td></tr>
+<tr><td><b>FunctionModel</b></td><td>PydanticAI 的模型适配接口；本项目用它将 ModelGateway 接进 Agent</td></tr>
+<tr><td><b>OpenSandbox</b></td><td>独立的沙箱平台服务（127.0.0.1:18080，Docker backend）</td></tr>
+</tbody>
+</table>
+
+<h2>常用缩写</h2>
+<ul>
+<li><b>API</b> — Application Programming Interface，程序接口；本项目即 FastAPI HTTP 控制面</li>
+<li><b>LLM</b> — Large Language Model，大语言模型（本项目中的"云模型"）</li>
+<li><b>Agent</b> — 能调用工具、自主规划执行步骤的 LLM 程序</li>
+<li><b>PII</b> — Personally Identifiable Information，个人可识别信息（邮箱、手机号、证件号等）</li>
+<li><b>FTS</b> — Full-Text Search，全文检索</li>
+<li><b>SSE</b> — 见上</li>
+<li><b>WAL</b> — Write-Ahead Logging，SQLite 预写日志模式（并发读写友好）</li>
+<li><b>OTel</b> — OpenTelemetry，可观测性标准</li>
+<li><b>DTO</b> — Data Transfer Object，跨边界传输的数据结构（本项目 <code>api/models.py</code>）</li>
+<li><b>TOML</b> — 配置文件格式（<code>dataharness.example.toml</code>）</li>
+</ul>
+
+<footer class="site">
+  <span>DataHarness 教程 · <a href="index.html">课程首页</a></span>
+  <span>有不懂的地方？问你的 AI 老师。</span>
+</footer>
+</main>
+</body>
+</html>

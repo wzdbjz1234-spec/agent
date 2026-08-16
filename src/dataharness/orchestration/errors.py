@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataharness.privacy import ModelProviderError
 from dataharness.sandbox import (
     SandboxLostError,
     SandboxOutputLimitError,
@@ -69,6 +70,11 @@ def classify_error(error: BaseException) -> tuple[FailureClass, bool]:
     """
     if isinstance(error, OrchestrationError):
         return error.failure_class, error.retryable
+    if isinstance(error, ModelProviderError):
+        # 配置缺失、鉴权失败和无效响应都不能靠重试修复；短暂超时/上游故障
+        # 仍允许走统一的有限重试，错误分类本身不包含模型原文。
+        retryable = error.code in {"MODEL_TIMEOUT", "MODEL_UPSTREAM_ERROR", "MODEL_RATE_LIMITED"}
+        return FailureClass.MODEL_CORRECTABLE, retryable
     if isinstance(error, (SandboxTimeoutError, SandboxOutputLimitError)):
         return FailureClass.RESOURCE_LIMIT, True
     if isinstance(error, SandboxLostError):

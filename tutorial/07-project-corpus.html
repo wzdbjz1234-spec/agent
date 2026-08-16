@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 文件导入与检索 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 07 · 数据的入口</div>
+  <h1>文件导入、全文检索与快照：ProjectCorpus</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/projects/</code>：一条上传的文件如何变成「可被 Agent 检索的只读快照」。这是 Agent 分析的原材料来源。</p>
+</header>
+<main>
+
+<h2>1. ProjectCorpus 是什么</h2>
+<p>它是「项目的语料库」，一个 deep module（深模块）：对外只暴露几个小方法（<span class="cite">ARCHITECTURE.md:159-162</span>），内部封装了文件导入、格式提取、全文索引、快照、检索全部复杂度：</p>
+<pre><code>import_files / create_snapshot / search / open_resource / full_project_coverage / ...</code></pre>
+<p>对应的类在 <code>projects/corpus.py</code>（约 355 行），用到的三个兄弟模块：</p>
+<ul>
+<li><code>projects/extractors.py</code> —— 识别真实格式并提取文本/元数据；</li>
+<li><code>projects/index.py</code> —— 每项目一个 SQLite FTS5/BM25 全文索引；</li>
+<li><code>providers/workspace/local.py</code> —— 受控的文件落地（第 10 课还会用到它的路径策略）。</li>
+</ul>
+
+<h2>2. 导入管线：一条文件的生命线</h2>
+<p>核心在 <code>corpus.import_file</code>（<span class="cite">corpus.py:91-161</span>），先看全景（<span class="cite">ARCHITECTURE.md:251-260</span>）：</p>
+<div class="diagram">upload
+  -> validate real type / size / path        （sniff_media_type 看魔数，不信扩展名）
+  -> immutable ProjectFileVersion + SHA-256  （sources/ 下只读保存）
+  -> local extraction                        （PDF/Excel/Word… -> 可定位文本块）
+  -> FTS5/BM25 + metadata index              （indexes/corpus.sqlite3）
+  -> READY | FAILED | UNSUPPORTED            （最终状态，不可再改）</div>
+<p>代码分两段。第一段：在 UoW 里登记文件与版本（<span class="cite">corpus.py:93-107</span>）：</p>
+<pre><code>project = uow.repo.get_project(project_id).value
+if project.status != ProjectStatus.ACTIVE:
+    raise ValueError("归档项目不能导入新文件")
+current = next((item for item in uow.repo.list_project_files(project_id)
+                if item.name == normalized_name), None)
+if current is None:
+    current = ProjectFile(...); uow.repo.add_file(current); version_number = 1
+else:
+    version_number = len(uow.repo.list_file_versions(current.id)) + 1   # 同名 = 新版本
+version = ProjectFileVersion(...)
+uow.repo.add_file_version(version)</code></pre>
+<ul>
+<li><b>归档项目拒绝新文件</b> —— 归档只禁止新输入，不破坏历史（<span class="cite">ARCHITECTURE.md:411-412</span>）。</li>
+<li><b>同名上传 = 新版本</b>（version_number+1），绝不覆盖旧版本 —— 旧 Run 的输入视图不漂移。</li>
+</ul>
+<p>第二段：真实的 I/O 管线，任何异常都收敛到终态（<span class="cite">corpus.py:109-150</span>）：</p>
+<pre><code>try:
+    self._workspace.import_source(project_id, current.id, version.id, source, normalized_name, content_hash)
+    stored_path = self._workspace.source_path(...)
+    media_type = sniff_media_type(stored_path)          # 看魔数，不信扩展名
+    document = extract_document(stored_path, content_hash, media_type)
+    self._write_extracted(project_id, version.id, document)
+    CorpusIndex(self._workspace.index_path(project_id), self._max_snippet_chars).replace(
+        file_id=current.id, file_version_id=version.id, file_name=normalized_name, document=document)
+    final = version.mark_ready(content_hash, size, media_type, at=self._clock())
+except UnsupportedFormatError:
+    final = version.mark_unsupported(at=self._clock())
+except Exception:
+    final = version.mark_failed(at=self._clock())</code></pre>
+<p>顺序有讲究（<span class="cite">ARCHITECTURE.md:260</span>）：<b>先保存不可变原件</b>（解析崩溃也不丢输入），再提取、再索引；提取物和索引是「可重建的派生数据」，丢了可以用原件重建（<code>rebuild_derived</code>，<span class="cite">corpus.py:250-279</span>）。</p>
+
+<h2>3. 格式识别：相信魔数，不相信扩展名</h2>
+<p><code>sniff_media_type</code>（<span class="cite">extractors.py:53-87</span>）的逻辑：</p>
+<ul>
+<li>先看<b>魔数</b>（文件头部字节）：<code>%PDF-</code> 是 PDF、<code>PAR1</code> 是 parquet、<code>SQLite format 3\0</code> 是 SQLite、<code>DUCK</code> 是 DuckDB（<span class="cite">extractors.py:53-87</span>）。</li>
+<li>Office 格式（xlsx/docx/pptx）本质是 ZIP，检查 ZIP 容器内的结构。</li>
+<li>JSON/CSV/Markdown/纯文本只能按扩展名。</li>
+<li>都不认识 → <code>UnsupportedFormatError</code> → 版本标记 <code>UNSUPPORTED</code>，<b>不假装已分析</b>（<span class="cite">ARCHITECTURE.md:249</span>）。</li>
+</ul>
+<p>为什么不信扩展名？因为用户可以上传「改名成 .txt 的 PDF」，按扩展名走会解析失败或误判。</p>
+<p>支持的 11 种提取器（<span class="cite">extractors.py:261-273</span>）输出 <code>ExtractedDocument</code>：文本被切成带<b>定位信息</b>的 <code>TextChunk</code> —— 段落号、页码、工作表+行范围、幻灯片号（<span class="cite">ARCHITECTURE.md:247-249</span>）。定位信息是第 12 课 EvidenceGate 的根基：结论要能指向「第 3 页第 2 段」。提取器版本号 <code>EXTRACTOR_VERSION = "builtin-v1"</code>（<span class="cite">extractors.py:23</span>）绑定到每个提取物，升级提取器后旧索引可整体重建。</p>
+
+<h2>4. FTS5/BM25 全文索引</h2>
+<p>每个 Project 一个索引文件 <code>indexes/corpus.sqlite3</code>，结构（<span class="cite">index.py:21-36</span>）：</p>
+<pre><code>CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+    file_version_id UNINDEXED, locator_json UNINDEXED, text, metadata_json UNINDEXED,
+    tokenize='unicode61');</code></pre>
+<p>FTS5 是 SQLite 内置的全文检索虚拟表：<code>text</code> 列会被分词建倒排索引。检索函数 <code>search()</code>（<span class="cite">index.py:88-139</span>）：</p>
+<pre><code>SELECT metadata.file_id, chunks.file_version_id, metadata.file_name,
+       metadata.source_hash, metadata.media_type, chunks.text, chunks.locator_json,
+       bm25(chunks) AS rank
+FROM chunks JOIN index_metadata AS metadata
+  ON metadata.file_version_id = chunks.file_version_id
+WHERE {clauses}
+ORDER BY rank, chunks.rowid LIMIT ?</code></pre>
+<ul>
+<li><code>bm25(chunks)</code> 是 BM25 相关度评分（值越小越相关，所以 <code>score=-float(row["rank"])</code> 取负转成正的相似度，<span class="cite">index.py:139</span>）。</li>
+<li>检索范围被限制在 <b>Snapshot 的 READY 成员</b>里（<span class="cite">corpus.py:235-248</span>）——查的是「固定视图」，不是「最新文件」。</li>
+<li><code>unicode61</code> 分词器支持中文等非英文文本。</li>
+<li>调参（BM25 的 k1/b）在配置里：<code>[index] bm25_k1 = 1.2, bm25_b = 0.75</code>（<span class="cite">config.py:110-117</span>）。</li>
+</ul>
+<p>项目刻意<b>不用向量数据库</b>做跨文件检索 —— 结构化数据走 DuckDB，文档用本地全文检索（<span class="cite">ARCHITECTURE.md:273</span>），少一个重依赖。</p>
+
+<h2>5. 不可变快照：Run 的输入视图</h2>
+<p><code>create_snapshot</code>（<span class="cite">corpus.py:186-233</span>）把「每个逻辑文件的最新版本」固化成 <code>ProjectSnapshot</code>：</p>
+<pre><code>snapshot = ProjectSnapshot(
+    id=SnapshotId(self._ids.new("snapshot")),
+    project_id=project.id, created_at=self._clock(),
+    entries=tuple(SnapshotEntry(...) for item in versions),      # 所有版本，含 FAILED/UNSUPPORTED
+    index_version=INDEX_VERSION if any(v.status == FileVersionStatus.READY for v in versions) else None,
+    dataset_version_ids=tuple(item.id for item in datasets),
+)</code></pre>
+<p>随后 <code>materialize_snapshot</code> 把 READY 文件复制到 <code>snapshots/{snapshot_id}/</code> 下，作为沙箱只读挂载的源（<span class="cite">corpus.py:219-232</span>、<span class="cite">providers/workspace/local.py:202-230</span>）。</p>
+<div class="callout">
+<strong>为什么 Run 必须绑定快照而不是直接用最新文件？</strong>
+<p>可复现性。Run 开始后你又上传了新文件 —— 旧 Run 的分析必须<b>不受影响</b>（<span class="cite">ARCHITECTURE.md:262-264</span>）。快照创建后不可变（第 05/06 课的两层保险），崩溃恢复也用同一快照。想要新文件？创建新 Run 和新快照。</p>
+</div>
+
+<h2>6. 两种检索模式：RELEVANT 与 FULL_PROJECT</h2>
+<p>Agent 有两种「看文件」的方式（<span class="cite">ARCHITECTURE.md:266-272</span>）：</p>
+<table>
+<thead><tr><th>模式</th><th>行为</th><th>回答的要求</th></tr></thead>
+<tbody>
+<tr><td><b>RELEVANT</b></td><td>用 FTS5/BM25 找相关片段</td><td>只能声称使用了实际引用的文件</td></tr>
+<tr><td><b>FULL_PROJECT</b></td><td>枚举快照全部文件，分批提取/分析，生成 <code>ProjectCoverageReport</code></td><td>必须绑定覆盖报告；存在 FAILED/UNSUPPORTED/SKIPPED 项时必须披露缺口</td></tr>
+</tbody>
+</table>
+<p>覆盖报告的生成在 <code>full_project_coverage</code>（<span class="cite">corpus.py:317-355</span>），数据模型是 <code>ProjectCoverageReport</code>（<span class="cite">domain/project.py:176-212</span>），它有个 <code>has_uncovered()</code> 方法 —— 第 12 课会看到它如何变成回答里的「披露」。</p>
+
+<h2>7. 练习</h2>
+<div class="practice">
+<strong>练习：亲手导入一个文件</strong>
+<ol>
+<li>启动服务 <code>uv run dataharness serve</code>。</li>
+<li>建项目、上传一个 CSV（用 <span class="cite">README.md:266-286</span> 的 curl 命令）。</li>
+<li>用 <code>Invoke-RestMethod "http://127.0.0.1:8000/projects/…/files"</code> 看文件状态 —— 应该是 READY。</li>
+<li>在 <code>runtime-data/projects/{id}/</code> 下找到 sources/extracted/indexes 目录，确认三种产物都存在。把 extracted 里的 JSON 打开看看 chunk 的定位信息长什么样。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：同名文件再次上传会发生什么？</h4>
+<div class="options">
+  <button class="option" data-correct="false">覆盖旧文件，旧 Run 会读到新内容</button>
+  <button class="option" data-correct="true">创建新版本号（ProjectFileVersion），旧版本保留</button>
+  <button class="option" data-correct="false">直接报错 409</button>
+  <button class="option" data-correct="false">覆盖旧文件，但旧 Run 用缓存</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>corpus.py:98-107</code>：version_number + 1，旧版本文件在 sources/ 下永远保留（只读、不可变）。「禁止覆盖或删除被 Snapshot 引用的版本」（<span class="cite">ARCHITECTURE.md:242</span>）。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：一个内容异常的文件（如损坏的 PDF）导入后会怎样？</h4>
+<div class="options">
+  <button class="option" data-correct="false">导入请求直接失败，什么也不留下</button>
+  <button class="option" data-correct="true">原件已保存，版本被标记为 FAILED（可检索视图里没有它）</button>
+  <button class="option" data-correct="false">静默跳过，假装成功</button>
+  <button class="option" data-correct="false">解析失败后自动重试三次</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+先保存原件再解析（<span class="cite">corpus.py:109-150</span>），失败落到 FAILED 终态；FULL_PROJECT 覆盖报告必须列出它。诚实记录「分析不了」比假装分析完更符合项目的「不假装」原则。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p><a href="https://www.sqlite.org/fts5.html">SQLite FTS5 官方文档</a>（重点：全文查询语法、bm25 函数），
+和 <a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 7 节「Project Corpus 与 Workspace」。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「BM25 的 k1 和 b 参数什么意思？」「UNINDEXED 列是干什么的？」它可以结合代码和例子解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="06-storage-sqlite.html">上一课：存储层</a>
+  <a class="next" href="08-agent-basics.html">下一课：Agent 基础</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 07 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

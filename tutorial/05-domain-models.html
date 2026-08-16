@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 领域模型与状态机 · DataHarness 教程</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site">
+  <div class="kicker">Lesson 05 · 项目的核心数据结构</div>
+  <h1>领域模型与状态机：不可变对象如何管状态</h1>
+  <p class="subtitle">本课解剖 <code>src/dataharness/domain/</code>：为什么所有对象都 frozen？状态转移表怎么工作？不变量如何被强制？</p>
+</header>
+<main>
+
+<h2>1. 什么是领域模型</h2>
+<p>领域模型 = 用代码表达「业务世界里的概念和规则」。DataHarness 的领域是：<b>用户有一个 Project，里面有文件；对 Project 发起 Task；Task 的执行是 Run；Run 里的分析动作是 Step；产出 Dataset/Artifact/Finding</b>。</p>
+<p>这条概念链对应的文件（<span class="cite">domain/__init__.py</span> 的导出）：</p>
+<pre><code>Project ── ProjectFile ── ProjectFileVersion ── ProjectSnapshot   (project.py)
+Task ────────────────────────────────────────────────────────      (task.py)
+Run ─────────────────────────────────────────────────────────      (run.py)
+AnalysisStep ────────────────────────────────────────────────      (step.py)
+Session ─────────────────────────────────────────────────────      (session.py)
+Dataset / Artifact ──────────────────────────────────────────      (artifact.py)
+Finding / FindingCandidate / EvidenceRef ────────────────────      (finding.py)
+Lineage / ResourceRef ───────────────────────────────────────      (lineage.py)</code></pre>
+
+<h2>2. 第一条铁律：domain 层是纯净的</h2>
+<p><code>domain/__init__.py</code> 的 docstring 写得很明确（<span class="cite">domain/__init__.py:1-5</span>）：</p>
+<blockquote>
+本层定义纯领域模型…不 import FastAPI/PydanticAI/OpenSandbox/sqlite3/OpenTelemetry，不执行 I/O，
+所有对象为 frozen 值对象/聚合。
+</blockquote>
+<p>这意味着：<b>领域对象不知道</b> HTTP、不知道数据库、不知道模型、不知道沙箱。它只回答「状态是什么、允许怎么变」。</p>
+<div class="callout">
+<strong>为什么要这样设计？</strong>
+<p>因为<b>核心规则最怕被技术细节污染</b>。状态机规则可以单独写 Hypothesis 属性测试（代码注释提到，<span class="cite">domain/state_machine.py:4-7</span>）；
+以后换数据库、换 Web 框架，规则一行都不用改。这就是第 01 课说的「分层依赖朝一个方向」。</p>
+</div>
+
+<h2>3. ID 即类型：NewType</h2>
+<p>所有标识符都是包装过的字符串（<span class="cite">domain/ids.py:13-32</span>）：</p>
+<pre><code>ProjectId = NewType("ProjectId", str)
+TaskId = NewType("TaskId", str)
+RunId = NewType("RunId", str)
+SnapshotId = NewType("SnapshotId", str)
+...共 12 种 ID</code></pre>
+<p><code>NewType</code> 不会在运行时增加检查，但<b>类型检查器（pyright）会防止</b>你把 <code>RunId</code> 传给需要 <code>TaskId</code> 的函数 —— 这对一个几十个模块相互调用的项目极其宝贵：编译期就消灭一类 bug。生产 ID 的格式是 <code>{前缀}_{uuid4().hex}</code>（<span class="cite">idgen.py:24-25</span>），测试用确定性递增 ID（<span class="cite">idgen.py:35-37</span>）。</p>
+
+<h2>4. 状态机：用转移表而不是 if-else</h2>
+<p>Task 的状态定义（<span class="cite">domain/task.py:20-26</span>）：</p>
+<pre><code>TASK_TRANSITIONS: TransitionTable[TaskStatus] = {
+    TaskStatus.QUEUED: frozenset({TaskStatus.ACTIVE, TaskStatus.CANCELLED}),
+    TaskStatus.ACTIVE: frozenset({TaskStatus.WAITING, TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}),
+    TaskStatus.WAITING: frozenset({TaskStatus.ACTIVE}),
+}</code></pre>
+<p>这是 <b>邻接表</b>：每个状态列出允许前往的状态。<code>check_transition</code>（<span class="cite">domain/state_machine.py:21-44</span>）检查一次转移是否合法：</p>
+<pre><code>def check_transition(table: TransitionTable[S], current: S, target: S, subject: str) -> None:
+    allowed = table.get(current, frozenset())
+    if target not in allowed:
+        raise IllegalStateTransitionError(
+            f"{subject} 不允许 {current.value} -> {target.value}，允许的转移: {…}"
+        )</code></pre>
+<p>状态方法（如 <code>Task.complete</code>，<span class="cite">domain/task.py:92-98</span>）内部调用它：</p>
+<pre><code>def complete(self, at: datetime | None = None) -> Task:
+    target = TaskStatus.COMPLETED
+    check_transition(TASK_TRANSITIONS, self.status, target, "Task")
+    return self.model_copy(update={"status": target, "completed_at": at or utcnow(), "updated_at": utcnow()})</code></pre>
+<p>看这个模式：<b>校验 → 复制 → 返回新实例</b>。旧对象完全不变，新对象是新状态。全部状态枚举和转移表：</p>
+<table>
+<thead><tr><th>聚合</th><th>状态枚举（<span class="cite">domain/enums.py</span>）</th><th>转移表位置</th></tr></thead>
+<tbody>
+<tr><td>Project</td><td>ACTIVE / ARCHIVED</td><td>归档幂等（<span class="cite">project.py:51-57</span>）</td></tr>
+<tr><td>Task</td><td>QUEUED/ACTIVE/WAITING/COMPLETED/FAILED/CANCELLED</td><td><span class="cite">task.py:20-26</span></td></tr>
+<tr><td>Run</td><td>QUEUED/RUNNING/WAITING/SUCCEEDED/FAILED/CANCELLED</td><td><span class="cite">run.py:20-26</span></td></tr>
+<tr><td>RunPhase</td><td>PREPARING→REASONING→EXECUTING→VERIFYING→FINALIZING</td><td><span class="cite">run.py:29-34</span>（严格前进）</td></tr>
+<tr><td>Step</td><td>PENDING/RUNNING/SUCCEEDED/FAILED/TIMED_OUT/CANCELLED</td><td><span class="cite">step.py:19-24</span></td></tr>
+<tr><td>Finding</td><td>DRAFT/VERIFIED/WARNING/REJECTED</td><td><span class="cite">finding.py:65-69</span></td></tr>
+</tbody>
+</table>
+
+<h2>5. 不变量：构造时就被强制</h2>
+<p>光有状态机还不够 —— 状态和字段之间还有一致性约束。Pydantic 的 <code>model_validator</code> 在<b>对象创建的瞬间</b>检查（<span class="cite">domain/task.py:46-55</span>）：</p>
+<pre><code>@model_validator(mode="after")
+def _check_wait_reason_consistency(self) -> Task:
+    if (self.status == TaskStatus.WAITING) != (self.wait_reason is not None):
+        raise ValueError("WAITING 状态必须且只能带 wait_reason")
+    if (self.prompt_ref is None) != (self.prompt_hash is None):
+        raise ValueError("prompt_ref 与 prompt_hash 必须同时存在")
+    return self</code></pre>
+<p>「WAITING 必须有 wait_reason」这类规则，在对象出生时就保证，不可能构造出「WAITING 但没有原因」的矛盾对象。Step 也有类似规则：FAILED 必须带 failure_kind（<span class="cite">domain/step.py:41-48</span>）。</p>
+
+<h2>6. 不可变性：三件套（领域层）</h2>
+<p>以 <code>ProjectSnapshot</code> 为例（<span class="cite">domain/project.py:144-162</span>）—— 这是全项目最重要的不可变对象：</p>
+<pre><code>class ProjectSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True)          # ① 对象不可变
+    id: SnapshotId
+    project_id: ProjectId
+    entries: tuple[SnapshotEntry, ...] = ()         # ② 成员是元组
+    index_version: str | None = None
+    dataset_version_ids: tuple[DatasetId, ...] = ()
+
+    def ready_entries(self) -> tuple[SnapshotEntry, ...]: ...</code></pre>
+<ul>
+<li>① frozen：无 setter，任何"更新"都报错。</li>
+<li>② 集合字段用 <code>tuple</code> 而非 <code>list</code>：list 可以 <code>append</code>，tuple 不行 —— 连嵌套结构都不可变。</li>
+<li>③ 语义：Snapshot 是 Run 的「数据视图」，创建后不可变 —— 文件后续更新<b>不允许</b>改变旧 Run 看到的输入。这是可复现性的根基（<span class="cite">ARCHITECTURE.md:262-264</span>）。</li>
+</ul>
+<p>同样的不可变三件套在<b>数据库层还有第二重保险</b>（SQLite 触发器禁止 UPDATE/DELETE snapshot 表，<span class="cite">storage/migrations/0001_runtime.sql:247-259</span>）——第 06 课展开。</p>
+
+<h2>7. 两个特殊的领域设计</h2>
+<h3>7.1 Finding 的两阶段提交流程</h3>
+<p>Agent 只能提交 <code>FindingCandidate</code>（候选结论），<b>只有 Host 的验证门能把它变成正式 Finding</b>（<span class="cite">domain/finding.py:1-5, 42-69</span>）：</p>
+<pre><code>class Finding(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: FindingId
+    candidate: FindingCandidate      # 包含证据列表，空证据直接构造失败
+    status: FindingStatus = FindingStatus.DRAFT</code></pre>
+<p>为什么？因为「模型自说自话」不能算数 —— 结论必须先过 Host 的 ExecutionGate/IntegrityGate/EvidenceGate（第 12 课）。</p>
+
+<h3>7.2 取消的两阶段</h3>
+<p><code>Run.request_cancel()</code> 只记录「取消意图」时间戳，真正的终态化由持有租约的 Worker 完成（<span class="cite">domain/run.py:49-51, 117-143</span>）：</p>
+<pre><code>def request_cancel(self, at: datetime | None = None) -> Run:
+    """只记录取消意图；终态化由持有有效 lease 的 Worker 执行。"""
+    if self.cancel_requested_at is None:
+        return self.model_copy(update={"cancel_requested_at": at or utcnow(), ...})
+    return self  # 幂等：已有意图则不重复</code></pre>
+<p>注释解释了原因：调用方线程不能和 Worker 的沙箱提交竞态。意图与执行分离，是并发安全的经典手法（第 11 课讲 Worker 如何响应它）。</p>
+
+<h2>8. 练习</h2>
+<div class="practice">
+<strong>练习：读状态机</strong>
+<ol>
+<li>打开 <code>domain/run.py</code>，默写 RUN_TRANSITIONS 的三行转移表，然后对照代码检查。</li>
+<li>在 <code>domain/step.py</code> 里找到 <code>fail()</code> 方法，看它如何强制 failure_kind 与 FAILED 状态绑定。</li>
+<li>尝试在 Python REPL（<code>uv run python</code>）里构造一个非法状态：<code>Task(status="WAITING")</code>（不带 wait_reason），观察报错。然后构造合法版本。</li>
+<li>读 <code>domain/state_machine.py</code> 全文（44 行），说出 <code>subject</code> 参数在错误信息里的作用。</li>
+</ol>
+</div>
+
+<div class="quiz">
+<h4>小测验：domain 层为什么禁止 import sqlite3？</h4>
+<div class="options">
+  <button class="option" data-correct="false">sqlite3 太慢</button>
+  <button class="option" data-correct="true">保持领域规则纯净、可测试、与基础设施解耦</button>
+  <button class="option" data-correct="false">SQLite 有安全漏洞</button>
+  <button class="option" data-correct="false">没有原因，纯习惯</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+<code>domain/__init__.py:1-5</code> 明确声明：不 import 框架/SDK、不执行 I/O。状态机规则因此可以在内存里快速测试；换存储/框架时规则不变。
+</div></details>
+</div>
+
+<div class="quiz">
+<h4>小测验：Agent 想直接发布一个 Finding，应该怎么做？</h4>
+<div class="options">
+  <button class="option" data-correct="false">调用 Finding 模型的 verify() 方法</button>
+  <button class="option" data-correct="false">直接改数据库行</button>
+  <button class="option" data-correct="true">提交 FindingCandidate，由 Host 验证门提升状态</button>
+  <button class="option" data-correct="false">没法做，Agent 只能等待</button>
+</div>
+<div class="feedback"></div>
+<details><summary>查看解析</summary><div class="explain">
+候选与正式状态分离（<span class="cite">finding.py:42-69</span>）：Agent 只能提交候选；<code>VerificationService.verify</code>（<span class="cite">analysis/verification.py:290-346</span>）跑完三个 Gate 后决定 VERIFIED/WARNING/REJECTED。这就是「模型不能自证」的设计。
+</div></details>
+</div>
+
+<div class="rec">
+<strong>课后主源阅读</strong>
+<p>Pydantic 的 <a href="https://docs.pydantic.dev/latest/concepts/validators/">校验器文档</a>（model_validator 一节），
+和 <a href="../ARCHITECTURE.md">ARCHITECTURE.md</a> 第 13 节「状态机」（<span class="cite">ARCHITECTURE.md:407-471</span>）——把本节内容对照官方描述。</p>
+</div>
+
+<div class="ask">
+<strong>有不懂的地方？</strong>
+<p>直接问你的 AI 老师，例如：「NewType 和 typing.Literal 有什么区别？」「为什么 Run 的取消要分两个阶段？」它可以结合代码解释。</p>
+</div>
+
+<nav class="course-nav">
+  <a class="prev" href="04-config-system.html">上一课：配置系统</a>
+  <a class="next" href="06-storage-sqlite.html">下一课：存储层</a>
+</nav>
+<footer class="site">
+  <span><a href="index.html">课程首页</a></span>
+  <span>Lesson 05 / 13</span>
+</footer>
+</main>
+<script src="assets/quiz.js" defer></script>
+</body>
+</html>

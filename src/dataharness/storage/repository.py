@@ -368,11 +368,26 @@ class RuntimeRepository:
         ).fetchall()
         return tuple(self._run_from_row(row) for row in rows)
 
+    def list_steps_for_run(self, run_id: RunId) -> tuple[AnalysisStep, ...]:
+        """按创建顺序读取一个 Run 的 Step，供恢复和 Verification 重建摘要。"""
+        rows = self._connection.execute(
+            "SELECT id FROM analysis_steps WHERE run_id = ? ORDER BY created_at, id",
+            (str(run_id),),
+        ).fetchall()
+        return tuple(self.get_step(StepId(row["id"])).value for row in rows)
+
     def list_findings_for_task(self, task_id: TaskId) -> tuple[Finding, ...]:
         """按创建顺序返回 Task 的 Finding，供回答层复用同一事实源。"""
         rows = self._connection.execute(
             "SELECT id FROM findings WHERE task_id = ? ORDER BY created_at, id",
             (str(task_id),),
+        ).fetchall()
+        return tuple(self.get_finding(FindingId(row["id"])).value for row in rows)
+
+    def list_findings_for_run(self, run_id: RunId) -> tuple[Finding, ...]:
+        """只返回当前 Run 的 Finding，避免验证时误触发历史 Run 的草稿。"""
+        rows = self._connection.execute(
+            "SELECT id FROM findings WHERE run_id = ? ORDER BY created_at, id", (str(run_id),)
         ).fetchall()
         return tuple(self.get_finding(FindingId(row["id"])).value for row in rows)
 
@@ -488,8 +503,13 @@ class RuntimeRepository:
 
     def add_session(self, session: Session) -> None:
         self._connection.execute(
-            "INSERT INTO sessions(id, label, created_at) VALUES (?, ?, ?)",
-            (str(session.id), session.label, _iso(session.created_at)),
+            "INSERT INTO sessions(id, project_id, label, created_at) VALUES (?, ?, ?, ?)",
+            (
+                str(session.id),
+                str(session.project_id) if session.project_id else None,
+                session.label,
+                _iso(session.created_at),
+            ),
         )
         self.append_event("session", str(session.id), "SESSION_CREATED", session.created_at)
 
@@ -502,17 +522,38 @@ class RuntimeRepository:
             session_id,
         )
         return Session(
-            id=SessionId(row["id"]), label=row["label"], created_at=_dt(row["created_at"])
+            id=SessionId(row["id"]),
+            project_id=ProjectId(row["project_id"]) if row["project_id"] else None,
+            label=row["label"],
+            created_at=_dt(row["created_at"]),
+        )
+
+    def list_sessions(self, project_id: ProjectId) -> tuple[Session, ...]:
+        """按 Project 返回 Session，防止 API 把其他项目的对话目录暴露出来。"""
+        rows = self._connection.execute(
+            "SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at, id",
+            (str(project_id),),
+        ).fetchall()
+        return tuple(
+            Session(
+                id=SessionId(row["id"]),
+                project_id=ProjectId(row["project_id"]) if row["project_id"] else None,
+                label=row["label"],
+                created_at=_dt(row["created_at"]),
+            )
+            for row in rows
         )
 
     def add_task(self, task: Task) -> None:
         self._connection.execute(
-            "INSERT INTO tasks(id, project_id, session_id, status, wait_reason, created_at, updated_at, completed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks(id, project_id, session_id, prompt_ref, prompt_hash, status, wait_reason, created_at, updated_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(task.id),
                 str(task.project_id),
                 str(task.session_id) if task.session_id else None,
+                task.prompt_ref,
+                str(task.prompt_hash) if task.prompt_hash else None,
                 task.status,
                 task.wait_reason,
                 _iso(task.created_at),
@@ -534,6 +575,8 @@ class RuntimeRepository:
             id=TaskId(row["id"]),
             project_id=ProjectId(row["project_id"]),
             session_id=SessionId(row["session_id"]) if row["session_id"] else None,
+            prompt_ref=row["prompt_ref"],
+            prompt_hash=ContentHash(row["prompt_hash"]) if row["prompt_hash"] else None,
             status=TaskStatus(row["status"]),
             wait_reason=WaitReason(row["wait_reason"]) if row["wait_reason"] else None,
             created_at=_dt(row["created_at"]),
@@ -542,11 +585,27 @@ class RuntimeRepository:
         )
         return StoredRecord(value=value, version=row["row_version"])
 
+    def list_tasks_for_project(self, project_id: ProjectId) -> tuple[Task, ...]:
+        """按创建时间返回项目任务，供项目工作台展示最近执行入口。"""
+        rows = self._connection.execute(
+            "SELECT id FROM tasks WHERE project_id = ? ORDER BY created_at DESC",
+            (str(project_id),),
+        ).fetchall()
+        return tuple(self.get_task(TaskId(row["id"])).value for row in rows)
+
     def save_task(self, task: Task, expected_version: int, event_type: str) -> StoredRecord[Task]:
         current = self.get_task(task.id)
-        if (current.value.project_id, current.value.session_id, current.value.created_at) != (
+        if (
+            current.value.project_id,
+            current.value.session_id,
+            current.value.prompt_ref,
+            current.value.prompt_hash,
+            current.value.created_at,
+        ) != (
             task.project_id,
             task.session_id,
+            task.prompt_ref,
+            task.prompt_hash,
             task.created_at,
         ):
             raise ConcurrencyConflictError("Task 身份字段不可修改")
