@@ -103,8 +103,8 @@ async def test_phase11_prompt_worker_agent_and_sse_replay(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_phase11_casual_prompt_completes_without_sandbox(tmp_path: Path) -> None:
-    """纯问候走本地回复，不启动 Sandbox 或调用模型工具。"""
+async def test_phase11_casual_prompt_uses_the_same_agent_loop(tmp_path: Path) -> None:
+    """问候也走同一个自然语言 Agent，不由固定白名单绕过模型。"""
     service, client = _service(tmp_path)
     project_id = client.post("/projects", json={"name": "casual"}).json()["id"]
     snapshot = service.corpus.create_snapshot(ProjectId(project_id))
@@ -114,7 +114,7 @@ async def test_phase11_casual_prompt_completes_without_sandbox(tmp_path: Path) -
     )
     task_id = task_payload.json()["task"]["id"]
     sandbox = FakeSandboxProvider()
-    cloud = ScriptedCloud([])
+    cloud = ScriptedCloud(["你好！我是 DataHarness，可以帮你分析当前项目中的数据。"])
     settings = Settings(
         paths=PathsConfig(runtime_data_root=tmp_path / "runtime-data"),
         sandbox=SandboxConfig(image_digest="sha256:" + "a" * 64),
@@ -132,7 +132,7 @@ async def test_phase11_casual_prompt_completes_without_sandbox(tmp_path: Path) -
     assert result is not None
     assert str(result.status) == "SUCCEEDED"
     assert not sandbox._leases
-    assert not cloud.calls
+    assert cloud.calls
     answer = client.get(f"/tasks/{task_id}/answer").json()
     assert answer["task_status"] == "COMPLETED"
     assert "你好" in answer["answer"]

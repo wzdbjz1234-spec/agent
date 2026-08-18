@@ -12,8 +12,7 @@ from .context import (
     RestoredContext,
 )
 from .handler import AgentPromptError, AgentRunHandler
-from .intent import PromptIntent, casual_reply, classify_prompt
-from .models import AgentDependencies, AgentFinalOutput, AgentRunResult
+from .models import AgentDependencies, AgentRunResult, AgentTextOutput
 from .runner import AgentBudgetExhausted, AgentRunner
 
 __all__ = [
@@ -21,20 +20,17 @@ __all__ = [
     "AgentCheckpointEnvelope",
     "AgentContextState",
     "AgentDependencies",
-    "AgentFinalOutput",
+    "AgentTextOutput",
     "AgentRunResult",
     "AgentPromptError",
     "AgentRunHandler",
     "AgentRunner",
-    "PromptIntent",
     "CheckpointCorruptError",
     "CompactedContext",
     "ContextCheckpointError",
     "ContextCheckpointManager",
     "ContextCompactor",
     "RestoredContext",
-    "casual_reply",
-    "classify_prompt",
     "create_agent",
     "default_usage_limits",
 ]

@@ -1,12 +1,15 @@
-"""Agent 依赖、结构化输出与运行结果模型。"""
+"""Agent 依赖与自然语言运行结果模型。
+
+Agent 的最终回答是面向用户的自然语言，不再使用一个强制的 JSON 输出协议。
+工具调用仍由 PydanticAI 根据函数签名校验；只有正式报告和发布产物才需要独立的
+结构化模型。
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from dataharness.analysis import AnalysisRuntime
 from dataharness.capabilities.memory import MemoryCapability
@@ -18,38 +21,31 @@ from dataharness.skills import SkillRegistry
 from .context import ContextCheckpointManager
 
 
-class AgentFinalOutput(BaseModel):
-    """Agent 唯一结构化最终输出；正式资源必须通过稳定引用表达。"""
+@dataclass(frozen=True, slots=True)
+class AgentTextOutput:
+    """一次 Agent 的自然语言结果。
 
-    model_config = ConfigDict(frozen=True)
+    ``answer``、``status`` 和 ``references`` 属性只为迁移期调用方保留兼容读取，
+    它们不是模型输出 schema，也不会触发 JSON 生成或结构化重试。
+    """
 
-    status: Literal["COMPLETED", "WAITING"]
-    answer: str = Field(min_length=1, max_length=50_000)
-    references: tuple[ResourceRef, ...] = ()
-    unresolved_issues: tuple[str, ...] = ()
+    text: str
 
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_waiting_summary(cls, value: object) -> object:
-        """兼容模型把 WAITING 说明写成 ``summary`` 的常见结构变体。
+    @property
+    def answer(self) -> str:
+        return self.text
 
-        DeepSeek 等 OpenAI-compatible 模型有时会依据自身训练过的 Agent schema，
-        在 ``status=WAITING`` 时返回 ``summary`` 而不是本项目约定的 ``answer``。
-        ``answer`` 是统一的用户可见说明字段，因此这里只做窄字段重命名，不接受任意
-        字段拼接，也不改变 COMPLETED 输出的严格校验。
-        """
-        if (
-            not isinstance(value, dict)
-            or value.get("status") != "WAITING"
-            or "answer" in value
-        ):
-            return value
-        summary = value.get("summary")
-        if isinstance(summary, str) and summary.strip():
-            normalized = dict(value)
-            normalized["answer"] = summary
-            return normalized
-        return value
+    @property
+    def status(self) -> Literal["COMPLETED"]:
+        return "COMPLETED"
+
+    @property
+    def references(self) -> tuple[ResourceRef, ...]:
+        return ()
+
+    @property
+    def unresolved_issues(self) -> tuple[str, ...]:
+        return ()
 
 
 @dataclass(slots=True)
@@ -83,8 +79,8 @@ class AgentDependencies:
 
 @dataclass(frozen=True, slots=True)
 class AgentRunResult:
-    """结构化结果及其最终 checkpoint。"""
+    """自然语言结果及其最终 checkpoint。"""
 
-    output: AgentFinalOutput
+    output: AgentTextOutput
     checkpoint_ref: str
     messages_count: int

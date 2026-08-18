@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from dataharness.domain import Artifact, Dataset, Finding, Lineage
+from dataharness.domain import Artifact, ConversationMessage, Dataset, Finding, Lineage
 
 
 class CreateProjectRequest(BaseModel):
@@ -21,6 +21,23 @@ class CreateSessionRequest(BaseModel):
     """创建固定属于当前 Project 的连续对话 Session。"""
 
     label: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class SendMessageRequest(BaseModel):
+    """发送一条普通对话消息；它不会隐式创建 Task/Run。"""
+
+    content: str = Field(min_length=1, max_length=200_000)
+    # 只保存用户可见的 user/assistant 消息，不保存隐藏思考、工具载荷或原始模型请求。
+    persist: bool = True
+
+
+class ConversationResponse(BaseModel):
+    """自然语言聊天结果与可选的分析输入边界。"""
+
+    user: ConversationMessage
+    assistant: ConversationMessage
+    snapshot_id: str | None = None
+    analysis_job: dict[str, str] | None = None
 
 
 class CreateTaskRequest(BaseModel):

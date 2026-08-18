@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from dataharness.domain import TaskId
-
 from .policy import BoundaryKind, PreparedRequest, PrivacyPolicy
 
 
@@ -33,9 +31,9 @@ class ModelGateway:
         self._provider = provider
         self._policy = policy
 
-    def complete(self, task_id: TaskId, request: str) -> PreparedRequest:
+    def complete(self, scope_id: str, request: str) -> PreparedRequest:
         """在 Provider 调用前阻断 secret、占位 PII，且再次脱敏模型回复。"""
-        prepared = self._policy.prepare_request(task_id, request)
+        prepared = self._policy.prepare_request(scope_id, request)
         try:
             response = self._provider.complete(prepared.cloud_text)
         except ModelProviderError:
@@ -43,28 +41,30 @@ class ModelGateway:
             # 这里不能再把底层异常正文包装回调用方。
             raise
         except Exception as error:
-            safe = self._policy.sanitize_boundary_text(task_id, str(error), BoundaryKind.EXCEPTION)
+            safe = self._policy.sanitize_boundary_text(
+                scope_id, str(error), BoundaryKind.EXCEPTION
+            )
             raise ModelProviderError(safe.cloud_text) from error
-        return self._policy.sanitize_boundary_text(task_id, response, BoundaryKind.RESPONSE)
+        return self._policy.sanitize_boundary_text(scope_id, response, BoundaryKind.RESPONSE)
 
-    def sanitize_tool_result(self, task_id: TaskId, text: str) -> PreparedRequest:
+    def sanitize_tool_result(self, scope_id: str, text: str) -> PreparedRequest:
         """供工具结果写入模型消息、日志前统一再扫描。"""
-        return self._policy.sanitize_boundary_text(task_id, text, BoundaryKind.TOOL_RESULT)
+        return self._policy.sanitize_boundary_text(scope_id, text, BoundaryKind.TOOL_RESULT)
 
-    def sanitize_compaction(self, task_id: TaskId, text: str) -> PreparedRequest:
+    def sanitize_compaction(self, scope_id: str, text: str) -> PreparedRequest:
         """供摘要/压缩内容写入 checkpoint 前统一再扫描。"""
-        return self._policy.sanitize_boundary_text(task_id, text, BoundaryKind.COMPACTION)
+        return self._policy.sanitize_boundary_text(scope_id, text, BoundaryKind.COMPACTION)
 
-    def sanitize_log(self, task_id: TaskId, text: str) -> PreparedRequest:
+    def sanitize_log(self, scope_id: str, text: str) -> PreparedRequest:
         """供日志和 trace exporter 使用的统一再扫描入口。"""
-        return self._policy.sanitize_boundary_text(task_id, text, BoundaryKind.LOG)
+        return self._policy.sanitize_boundary_text(scope_id, text, BoundaryKind.LOG)
 
-    def sanitize_trace(self, task_id: TaskId, text: str) -> PreparedRequest:
+    def sanitize_trace(self, scope_id: str, text: str) -> PreparedRequest:
         """供 trace 属性字符串使用的统一再扫描入口。"""
-        return self._policy.sanitize_boundary_text(task_id, text, BoundaryKind.TRACE)
+        return self._policy.sanitize_boundary_text(scope_id, text, BoundaryKind.TRACE)
 
     def restore_tool_input(
-        self, task_id: TaskId, text: str, *, allowed_kinds: tuple[str, ...]
+        self, scope_id: str, text: str, *, allowed_kinds: tuple[str, ...]
     ) -> str:
-        """仅在 Sandbox 工具调用前恢复当前 Task 已登记且类型允许的 PII。"""
-        return self._policy.restore_tool_input(task_id, text, allowed_kinds=allowed_kinds)
+        """仅在 Sandbox 工具调用前恢复当前 scope 已登记且类型允许的 PII。"""
+        return self._policy.restore_tool_input(scope_id, text, allowed_kinds=allowed_kinds)

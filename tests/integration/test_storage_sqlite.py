@@ -61,13 +61,14 @@ def _queued_store(tmp_path: Path) -> tuple[SqliteRuntimeStore, Run]:
 def test_empty_database_upgrade_replay_and_wal(tmp_path: Path) -> None:
     factory = RuntimeConnectionFactory(tmp_path / "runtime.db")
     first = factory.connect()
-    # Phase 11 增加 prompt 引用与 Session Project 作用域，schema 版本推进到 5。
-    assert current_schema_version(first) == 5
+    # Chat-first 对话消息 migration 将 schema 版本推进到 6；普通对话与 Task/Run
+    # 使用不同事实表。
+    assert current_schema_version(first) == 6
     assert first.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert first.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     first.close()
     second = factory.connect()
-    assert current_schema_version(second) == 5
+    assert current_schema_version(second) == 6
     second.close()
 
 

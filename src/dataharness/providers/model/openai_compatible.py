@@ -31,11 +31,28 @@ def _message_content(part: dict[str, Any]) -> str:
     return json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _flush_tool_calls(
+    result: list[dict[str, Any]], pending_tool_calls: list[dict[str, Any]]
+) -> None:
+    if not pending_tool_calls:
+        return
+    result.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": list(pending_tool_calls),
+        }
+    )
+    pending_tool_calls.clear()
+
+
 def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """把 PydanticAI 消息投影成普通 Chat Completions 消息。"""
     result: list[dict[str, Any]] = []
     for message in messages:
         message_kind = str(message.get("kind", ""))
+        pending_tool_calls: list[dict[str, Any]] = []
+
         for part in message.get("parts", []):
             if not isinstance(part, dict):
                 continue
@@ -50,23 +67,18 @@ def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 args = part.get("args", {})
                 if not isinstance(args, str):
                     args = json.dumps(args, ensure_ascii=False, sort_keys=True)
-                result.append(
+                pending_tool_calls.append(
                     {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": str(part.get("tool_call_id", "gateway-tool-call")),
-                                "type": "function",
-                                "function": {
-                                    "name": str(part.get("tool_name", "")),
-                                    "arguments": args,
-                                },
-                            }
-                        ],
+                        "id": str(part.get("tool_call_id", "gateway-tool-call")),
+                        "type": "function",
+                        "function": {
+                            "name": str(part.get("tool_name", "")),
+                            "arguments": args,
+                        },
                     }
                 )
             elif kind in {"tool-return", "tool_return"}:
+                _flush_tool_calls(result, pending_tool_calls)
                 result.append(
                     {
                         "role": "tool",
@@ -75,11 +87,13 @@ def _openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     }
                 )
             elif message_kind == "request":
+                _flush_tool_calls(result, pending_tool_calls)
                 # 未知请求部件不应被静默解释成自然语言；保留一个无敏感结构的文本
                 # 片段，以便兼容未来的 PydanticAI 轻量消息部件。
                 content = part.get("content")
                 if isinstance(content, str) and content:
                     result.append({"role": "user", "content": content})
+        _flush_tool_calls(result, pending_tool_calls)
     return result
 
 
@@ -180,25 +194,35 @@ class OpenAICompatibleCloudModelProvider:
         reasoning = choice.get("reasoning_content") if isinstance(choice, dict) else None
         reasoning_text = reasoning if isinstance(reasoning, str) and reasoning else None
         if isinstance(tool_calls, list) and tool_calls:
-            call = tool_calls[0]
-            function = call.get("function", {}) if isinstance(call, dict) else {}
-            name = function.get("name") if isinstance(function, dict) else None
-            if not isinstance(name, str) or not name:
-                raise ModelProviderError("模型工具调用缺少名称", code="MODEL_RESPONSE_INVALID")
-            arguments = function.get("arguments", "{}")
-            try:
-                args: Any = json.loads(arguments) if isinstance(arguments, str) else arguments
-            except ValueError as error:
-                raise ModelProviderError(
-                    "模型工具参数不是有效 JSON", code="MODEL_RESPONSE_INVALID"
-                ) from error
-            result: dict[str, Any] = {
-                "tool_call": {
-                    "name": name,
-                    "args": args,
-                    "id": str(call.get("id", "gateway-tool-call")),
-                }
-            }
+            normalized_calls: list[dict[str, Any]] = []
+            for call in tool_calls:
+                function = call.get("function", {}) if isinstance(call, dict) else {}
+                name = function.get("name") if isinstance(function, dict) else None
+                if not isinstance(name, str) or not name:
+                    raise ModelProviderError(
+                        "模型工具调用缺少名称", code="MODEL_RESPONSE_INVALID"
+                    )
+                arguments = function.get("arguments", "{}")
+                try:
+                    args: Any = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except ValueError as error:
+                    raise ModelProviderError(
+                        "模型工具参数不是有效 JSON", code="MODEL_RESPONSE_INVALID"
+                    ) from error
+                normalized_calls.append(
+                    {
+                        "name": name,
+                        "args": args,
+                        "id": str(call.get("id", "gateway-tool-call")),
+                    }
+                )
+            result: dict[str, Any]
+            if len(normalized_calls) == 1:
+                # Preserve the existing adapter contract for providers/tests that
+                # only issue one call; multiple calls use the explicit plural form.
+                result = {"tool_call": normalized_calls[0]}
+            else:
+                result = {"tool_calls": normalized_calls}
             if reasoning_text:
                 result["reasoning"] = reasoning_text
             return json.dumps(result, ensure_ascii=False)

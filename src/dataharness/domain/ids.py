@@ -18,6 +18,7 @@ CoverageReportId = NewType("CoverageReportId", str)
 
 # 会话与任务生命周期
 SessionId = NewType("SessionId", str)
+MessageId = NewType("MessageId", str)
 TaskId = NewType("TaskId", str)
 RunId = NewType("RunId", str)
 StepId = NewType("StepId", str)

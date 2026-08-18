@@ -154,9 +154,10 @@ def build_local_worker(
         workspace,
         sandbox,
         gateway,
-        SkillRegistry(Path("skills")),
+        SkillRegistry(settings.paths.skills_root or Path("skills")),
         bridge=service.bridge,
         verification=service.verification,
+        active_skills=tuple((name, None) for name in settings.skills.active),
         history_store=history_store
         or SqliteHistoryStore(settings.paths.runtime_data_root / "history.db"),
     )

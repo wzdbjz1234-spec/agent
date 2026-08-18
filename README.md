@@ -1,13 +1,16 @@
 # DataHarness
 
-DataHarness 是一个本地优先的数据分析 Agent Harness：Project 文件在本地版本化保存，Task/Run/Step 状态写入 Runtime SQLite，生成的 Python/SQL 只允许进入 OpenSandbox，模型请求统一经过 ModelGateway 的 secret/PII 边界。
+DataHarness 是一个本地优先的数据分析 Agent 应用：用户先在 Project-scoped Conversation 中和数据对话，模型以自然语言回答并按需检索本地语料；只有需要 Python/SQL、图表或长时间计算时，才显式升级为 Analysis Task/Run。Project 文件在本地版本化保存，生成代码只允许进入 OpenSandbox，模型请求统一经过 ModelGateway 的 secret/PII 边界。
 
-当前版本是 V1 本地控制面和 Sandbox 验收工程，默认单机、单租户、仅回环地址。它不是公网生产服务，也不是已经打包好的 docker compose up 一键产品。下面的流程以 Windows PowerShell 为例，Linux/macOS 只需要替换路径和环境变量语法。
+当前版本是本地单用户 Agent 应用与 Sandbox 验收工程，默认单机、单租户、仅回环地址。它不是公网生产服务，也不是已经打包好的 docker compose up 一键产品。下面的流程以 Windows PowerShell 为例，Linux/macOS 只需要替换路径和环境变量语法。
 
 ## 1. 当前可用范围
 
 已实现并验证：
 
+- Chat-first Conversation API 和 React 对话工作台：普通消息不创建 Task/Run，只按用户选择保存可见 user/assistant 消息；模型最终回答是自然语言，不要求 JSON；
+- 本地 Agent 按需列出文件、全文检索和读取有界文件片段；需要隔离执行时仍通过显式 Analysis Task/Run 使用 Sandbox；
+- 可发现的本地 Skill Registry，附带 Wolfram Skill 使用约束（优先 MCP，缺省时只允许在批准的 Sandbox 中使用 wolframscript）；
 - 本地 FastAPI 控制面：Project、文件导入/版本/检索、Task、事件、Dataset、Artifact、Finding、lineage 和最终 answer 查询；
 - Runtime SQLite、每 Task 独立 Privacy SQLite、本地 Project/Task Workspace；
 - OpenSandbox Python SDK Adapter、固定 digest 镜像、默认断网、只读 ProjectSnapshot；
@@ -32,11 +35,13 @@ DataHarness 是一个本地优先的数据分析 Agent Harness：Project 文件�
 
 ## 2. 运行架构
 
-    浏览器/客户端
+    浏览器/客户端（Chat-first）
           │ HTTP，仅 127.0.0.1:8000
           ▼
     FastAPI API（当前可直接启动）
           │
+          ├── Conversation/Message：普通聊天事实（可选持久化，不创建 Task/Run）
+          ├── Chat Agent：自然语言输出 + 本地文件/FTS 工具
           ├── Runtime SQLite：Task/Run/Step/事件/队列/资源元数据
           ├── Privacy SQLite：每 Task 的 PII 映射，与 Runtime 分离
           ├── LocalWorkspace：Project sources、索引、Task working/staging
@@ -99,10 +104,15 @@ uv.lock 是依赖事实源。不要使用 pip install -r 替代锁文件安装�
     api_key = "<你的 API Key>"
     # base_url = "https://api.openai.com/v1"
 
-    [sandbox]
+[sandbox]
     endpoint = "http://127.0.0.1:18080"
     runtime = "secure-analysis"
-    network_enabled = false
+network_enabled = false
+
+[skills]
+# 只有管理员明确启用的 Skill 才会进入 Analysis Job；Wolfram 默认通过 MCP，
+# 没有 MCP 时只能在批准的 Sandbox 中使用 wolframscript。
+active = ["wolfram"]
 
 路径会派生为：
 
@@ -115,7 +125,7 @@ uv.lock 是依赖事实源。不要使用 pip install -r 替代锁文件安装�
 
     uv run dataharness check --config .\dataharness.local.toml
 
-注意：当前 model 配置主要用于声明和校验，真实模型 Provider 尚未由 serve 自动装配。
+注意：API 会按本地配置装配 OpenAI-compatible Provider；没有 API Key 时，聊天接口会返回稳定的配置错误，而不会把异常正文显示给用户。
 
 ## 6. 构建 secure-analysis 镜像
 

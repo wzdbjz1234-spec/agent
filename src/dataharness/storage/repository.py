@@ -17,6 +17,7 @@ from dataharness.domain import (
     Artifact,
     ArtifactId,
     ContentHash,
+    ConversationMessage,
     CoverageItem,
     CoverageItemStatus,
     CoverageReportId,
@@ -33,6 +34,8 @@ from dataharness.domain import (
     FindingStatus,
     Lineage,
     LineageId,
+    MessageId,
+    MessageRole,
     Project,
     ProjectCoverageReport,
     ProjectFile,
@@ -542,6 +545,52 @@ class RuntimeRepository:
                 created_at=_dt(row["created_at"]),
             )
             for row in rows
+        )
+
+    def add_conversation_message(self, message: ConversationMessage) -> None:
+        """保存用户显式保留的对话消息，不创建 Task/Run。"""
+        session = self.get_session(message.session_id)
+        if session.project_id != message.project_id:
+            raise InvalidMetadataError("消息所属 Project 与 Session 不一致")
+        self._connection.execute(
+            "INSERT INTO conversation_messages(id, project_id, session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(message.id),
+                str(message.project_id),
+                str(message.session_id),
+                message.role,
+                message.content,
+                _iso(message.created_at),
+            ),
+        )
+
+    def list_conversation_messages(
+        self, project_id: ProjectId, session_id: SessionId, *, limit: int = 200
+    ) -> tuple[ConversationMessage, ...]:
+        """按 Project/Session 双重作用域读取消息，避免跨项目历史泄露。"""
+        if not 0 < limit <= 1000:
+            raise ValueError("消息 limit 必须在 1 到 1000 之间")
+        rows = self._connection.execute(
+            "SELECT * FROM conversation_messages "
+            "WHERE project_id = ? AND session_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (str(project_id), str(session_id), limit),
+        ).fetchall()
+        return tuple(
+            reversed(
+                tuple(
+                    ConversationMessage(
+                        id=MessageId(row["id"]),
+                        project_id=ProjectId(row["project_id"]),
+                        session_id=SessionId(row["session_id"]),
+                        role=MessageRole(row["role"]),
+                        content=row["content"],
+                        created_at=_dt(row["created_at"]),
+                    )
+                    for row in rows
+                )
+            )
         )
 
     def add_task(self, task: Task) -> None:

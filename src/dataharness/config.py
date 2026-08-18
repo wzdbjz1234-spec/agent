@@ -28,6 +28,7 @@ class PathsConfig(BaseModel):
     runtime_data_root: Path = Field(default_factory=lambda: Path("runtime-data"))
     projects_root: Path | None = None
     privacy_root: Path | None = None
+    skills_root: Path | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -40,6 +41,8 @@ class PathsConfig(BaseModel):
                 resolved["projects_root"] = Path(root) / "projects"
             if not resolved.get("privacy_root"):
                 resolved["privacy_root"] = Path(root) / "privacy"
+            if not resolved.get("skills_root"):
+                resolved["skills_root"] = Path("skills")
             return resolved
         return data
 
@@ -140,6 +143,14 @@ class ResourceLimitsConfig(BaseModel):
     step_timeout_seconds: int = 300
 
 
+class SkillsConfig(BaseModel):
+    """管理员显式允许在 Analysis Job 中激活的本地 Skill。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    active: tuple[str, ...] = ()
+
+
 class Settings(BaseModel):
     """DataHarness 顶层配置。"""
 
@@ -152,6 +163,7 @@ class Settings(BaseModel):
     index: IndexConfig = Field(default_factory=IndexConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     resources: ResourceLimitsConfig = Field(default_factory=ResourceLimitsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
 
 
 def load_settings(path: Path) -> Settings:

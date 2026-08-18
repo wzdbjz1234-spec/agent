@@ -5,6 +5,7 @@
 [paths]
 # 本地运行数据根目录；projects/ 与 privacy/ 缺省派生自该根
 runtime_data_root = "runtime-data"
+skills_root = "skills"
 
 [model]
 provider = "deepseek"
@@ -43,3 +44,7 @@ disk_mb = 2048
 max_processes = 32
 max_output_bytes = 10485760
 step_timeout_seconds = 300
+
+[skills]
+# 只有管理员显式列出的 Skill 才会在 Analysis Job 中加载；例如启用本地 Wolfram 规范。
+active = ["wolfram"]

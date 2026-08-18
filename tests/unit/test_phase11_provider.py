@@ -102,6 +102,52 @@ def test_openai_compatible_provider_reports_missing_key_without_request() -> Non
     assert error.value.code == "MODEL_API_KEY_MISSING"
 
 
+def test_openai_compatible_provider_preserves_multiple_tool_calls(monkeypatch) -> None:
+    """一次模型回合可以并行请求多个窄工具，避免 Adapter 静默丢弃后续调用。"""
+    provider = OpenAICompatibleCloudModelProvider(
+        model="model",
+        base_url="http://model.test/v1",
+        timeout_seconds=1,
+        api_key="synthetic-key",
+    )
+
+    def fake_urlopen(request, timeout):
+        del request, timeout
+        return _Response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "one",
+                                    "function": {
+                                        "name": "list_project_files",
+                                        "arguments": "{}",
+                                    },
+                                },
+                                {
+                                    "id": "two",
+                                    "function": {
+                                        "name": "get_project_coverage",
+                                        "arguments": "{}",
+                                    },
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(openai_compatible, "urlopen", fake_urlopen)
+    payload = json.loads(provider.complete('{"messages": []}'))
+    assert [item["name"] for item in payload["tool_calls"]] == [
+        "list_project_files",
+        "get_project_coverage",
+    ]
+
+
 def test_deepseek_provider_uses_openai_compatible_adapter() -> None:
     provider = OpenAICompatibleCloudModelProvider.from_config(
         ModelProviderConfig(

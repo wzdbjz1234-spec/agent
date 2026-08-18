@@ -43,6 +43,15 @@ export function useSessions(projectId: string | undefined) {
   });
 }
 
+export function useConversationMessages(projectId: string | undefined, sessionId: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.messages(projectId ?? "", sessionId ?? ""),
+    queryFn: () => api.listConversationMessages(projectId as string, sessionId as string),
+    enabled: Boolean(projectId && sessionId),
+    staleTime: 1_000
+  });
+}
+
 export function useProjectTasks(projectId: string | undefined, sessionId?: string) {
   return useQuery({
     queryKey: queryKeys.tasks(projectId ?? "", sessionId),

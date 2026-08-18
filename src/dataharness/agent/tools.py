@@ -293,6 +293,67 @@ async def run_skill_script(
     return _safe_tool_result(ctx, result)
 
 
+async def run_wolfram(
+    ctx: RunContext[AgentDependencies],
+    expression: str,
+    timeout_seconds: int = 120,
+    budget_units: int = 1,
+) -> str:
+    """在已批准的 Sandbox 中调用本地 ``wolframscript``。
+
+    The expression is passed as one subprocess argument inside the Sandbox; the
+    Host never imports Wolfram, invokes a shell, or receives a cloud credential.
+    The tool is only registered when the administrator activates the Wolfram Skill.
+    """
+
+    name = "run_wolfram"
+    if not expression.strip() or len(expression) > 8_000:
+        raise ValueError("Wolfram expression 不能为空且不能超过 8000 个字符")
+    if not 1 <= timeout_seconds <= 600:
+        raise ValueError("Wolfram timeout_seconds 必须在 1 到 600 之间")
+    _call_log(
+        ctx,
+        name,
+        {
+            "expression": expression,
+            "timeout_seconds": timeout_seconds,
+            "budget_units": budget_units,
+        },
+    )
+    # json.dumps produces a safe Python string literal. The generated Python is
+    # still untrusted and is executed only by AnalysisRuntime/OpenSandbox.
+    expression_literal = json.dumps(expression, ensure_ascii=False)
+    code = f"""
+import json
+import shutil
+import subprocess
+
+expression = json.loads({json.dumps(expression_literal, ensure_ascii=False)})
+binary = shutil.which("wolframscript")
+if binary is None:
+    raise RuntimeError("wolframscript 不在当前 Sandbox 镜像中")
+completed = subprocess.run(
+    [binary, "-code", expression],
+    check=False,
+    capture_output=True,
+    text=True,
+    timeout={timeout_seconds},
+)
+if completed.returncode != 0:
+    raise RuntimeError("wolframscript 执行失败")
+print(completed.stdout[:65536])
+"""
+    try:
+        result = await ctx.deps.analysis.execute_python(
+            code, timeout_seconds=timeout_seconds, budget_units=budget_units
+        )
+    except Exception as error:
+        _error_log(ctx, name, error)
+        raise
+    _result_log(ctx, name, result)
+    return _safe_tool_result(ctx, result)
+
+
 async def search_history(ctx: RunContext[AgentDependencies], query: str, limit: int = 20) -> str:
     """检索独立对话历史；不读取 ProjectCorpus 或向量索引。"""
     name = "search_history"

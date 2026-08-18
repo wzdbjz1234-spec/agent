@@ -26,10 +26,12 @@ from .errors import ApiError
 from .models import (
     ApiErrorBody,
     ApiErrorResponse,
+    ConversationResponse,
     CreateProjectRequest,
     CreateSessionRequest,
     CreateTaskRequest,
     RetryTaskRequest,
+    SendMessageRequest,
 )
 from .services import ApiService, build_default_service
 
@@ -154,6 +156,11 @@ def create_app(
         """提供不含密钥和原始路径清单的本地运行诊断摘要。"""
         return service.diagnostics()
 
+    @app.get("/skills")
+    async def list_skills():
+        """返回本机管理员预装 Skill 的名称、说明和内容 hash。"""
+        return [item.model_dump(mode="json") for item in service.list_skills()]
+
     @app.post("/projects", status_code=status.HTTP_201_CREATED)
     async def create_project(payload: CreateProjectRequest):
         return service.create_project(payload.name).model_dump(mode="json")
@@ -191,6 +198,29 @@ def create_app(
     @app.get("/projects/{project_id}/sessions")
     async def list_sessions(project_id: str):
         return [item.model_dump(mode="json") for item in service.list_sessions(project_id)]
+
+    @app.get("/projects/{project_id}/sessions/{session_id}/messages")
+    async def list_conversation_messages(project_id: str, session_id: str):
+        """读取显式保存的可见消息；隐藏思考和工具载荷不属于聊天历史。"""
+        return [
+            item.model_dump(mode="json")
+            for item in service.list_conversation_messages(project_id, session_id)
+        ]
+
+    @app.post("/projects/{project_id}/sessions/{session_id}/messages")
+    async def send_conversation_message(
+        project_id: str, session_id: str, payload: SendMessageRequest
+    ):
+        """运行一轮 Chat Agent；普通消息不会创建 Task/Run。"""
+        result = await service.send_message(
+            project_id, session_id, payload.content, persist=payload.persist
+        )
+        return ConversationResponse(
+            user=result.user,
+            assistant=result.assistant,
+            snapshot_id=str(result.snapshot_id) if result.snapshot_id else None,
+            analysis_job=result.analysis_job,
+        ).model_dump(mode="json")
 
     @app.post("/projects/{project_id}/files", status_code=status.HTTP_201_CREATED)
     async def import_file(

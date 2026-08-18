@@ -1,5 +1,7 @@
 import type {
   Artifact,
+  ConversationMessage,
+  ConversationResponse,
   CreateTaskResponse,
   Dataset,
   Diagnostics,
@@ -112,6 +114,14 @@ export const api = {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ label: label || null })
+    }),
+  listConversationMessages: (projectId: string, sessionId: string) =>
+    request<ConversationMessage[]>(`/projects/${projectId}/sessions/${sessionId}/messages`),
+  sendMessage: (projectId: string, sessionId: string, content: string, persist = true) =>
+    request<ConversationResponse>(`/projects/${projectId}/sessions/${sessionId}/messages`, {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ content, persist })
     }),
   listTasks: (projectId: string, sessionId?: string) =>
     request<Task[]>(`/projects/${projectId}/tasks${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ""}`),

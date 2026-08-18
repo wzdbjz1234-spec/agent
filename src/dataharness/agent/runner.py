@@ -8,7 +8,7 @@ from pydantic_ai.messages import ModelMessage
 from pydantic_ai.usage import UsageLimits
 
 from .context import AgentContextState, ContextCompactor
-from .models import AgentDependencies, AgentFinalOutput, AgentRunResult
+from .models import AgentDependencies, AgentRunResult, AgentTextOutput
 
 
 class AgentBudgetExhausted(RuntimeError):
@@ -16,11 +16,11 @@ class AgentBudgetExhausted(RuntimeError):
 
 
 class AgentRunner:
-    """负责恢复历史消息、运行单一 Agent 并记录最终结构化状态。"""
+    """负责恢复历史消息、运行单一 Agent 并保存可恢复上下文。"""
 
     def __init__(
         self,
-        agent: Agent[AgentDependencies, AgentFinalOutput],
+        agent: Agent[AgentDependencies, str],
         *,
         compactor: ContextCompactor | None = None,
         context_budget_chars: int = 120_000,
@@ -68,13 +68,12 @@ class AgentRunner:
                 sandbox_image_digest=deps.sandbox_image_digest,
             )
             raise AgentBudgetExhausted("Agent 达到 UsageLimits") from error
-        output = result.output
-        refs = tuple(dict.fromkeys((*state.domain_refs, *output.references)))
+        output = AgentTextOutput(result.output.strip())
+        if not output.text:
+            raise RuntimeError("Agent 返回了空回答")
         next_state = state.model_copy(
             update={
-                "domain_refs": refs,
-                "unresolved_issues": output.unresolved_issues,
-                "progress": (*state.progress, f"Agent 返回 {output.status}"),
+                "progress": (*state.progress, "Agent 返回自然语言回答"),
             }
         )
         messages = tuple(result.all_messages())

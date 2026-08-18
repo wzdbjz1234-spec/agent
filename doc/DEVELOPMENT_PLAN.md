@@ -3,6 +3,8 @@
 > Status: Approved baseline
 > Plan version: 1.2
 > Architecture source: `ARCHITECTURE.md`
+>
+> Chat-first 修订：旧 Phase 08–12 条目描述的是兼容的 Task/Run 分析作业路径；普通对话、Message 持久化和自然语言模型输出以 `decision-004-chat-first-agent.md` 为当前入口。
 
 ## 1. Purpose
 

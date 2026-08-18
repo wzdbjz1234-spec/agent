@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .artifact import Artifact, Dataset
 from .clock import utcnow
+from .conversation import ConversationMessage, MessageRole
 from .enums import (
     CoverageItemStatus,
     FileVersionStatus,
@@ -38,6 +39,7 @@ from .ids import (
     FileVersionId,
     FindingId,
     LineageId,
+    MessageId,
     ProjectId,
     RunId,
     SessionId,
@@ -87,6 +89,9 @@ __all__ = [
     "InvalidStateError",
     "Lineage",
     "LineageId",
+    "MessageId",
+    "ConversationMessage",
+    "MessageRole",
     "Project",
     "ProjectCoverageReport",
     "ProjectFile",

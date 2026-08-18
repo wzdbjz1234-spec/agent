@@ -1,12 +1,12 @@
 # DataHarness V1 Architecture
 
-> 状态：V1 设计基线  
-> 更新日期：2026-08-13  
-> 定位：云端 LLM 驱动、本地持久化与隔离执行的数据分析 Agent Harness
+> 状态：V1 设计基线（Chat-first 修订见 `doc/decision-004-chat-first-agent.md`）
+> 更新日期：2026-08-17
+> 定位：面向本地数据的 Chat-first Agent 应用；长时分析通过显式 Analysis Job 使用隔离执行
 
 ## 1. 产品定位
 
-DataHarness 面向单机、单租户、长期项目资料与长时运行的数据分析任务。用户将文件导入持久 Project；云端 LLM 负责理解目标、跨文件检索与整合、规划、生成 Python/SQL、观察结果与组织回答；真实代码在本地 OpenSandbox 中执行；项目文件及索引、任务状态、产物、证据与隐私占位映射保存在本机。
+DataHarness 面向单机、单租户、长期项目资料与本地数据分析。用户将文件导入持久 Project，先在 Conversation 中和 Agent 对话；Agent 按需进行跨文件检索和有界读取，普通回合返回自然语言。只有 Python/SQL、图表发布或长时计算才显式升级为 Analysis Job，由本地 OpenSandbox 执行；项目文件及索引、作业状态、产物、证据与隐私占位映射保存在本机。
 
 项目的准确承诺是：
 
@@ -29,7 +29,7 @@ DataHarness 面向单机、单租户、长期项目资料与长时运行的数�
 - Sandbox 只能只读访问当前 Run 固定的 ProjectSnapshot，并写当前 Task Workspace，默认不能联网。
 - Runtime SQLite 与隐私映射库不得暴露给 Agent 或 Sandbox。
 - 密码、API Token、私钥、Cookie、连接串等凭据不得发送给模型。
-- 常见 PII 在出境视图中使用 Task 内稳定的类型化占位符。
+- 常见 PII 在出境视图中使用当前 Agent scope 内稳定的类型化占位符。
 - 长任务可暂停、取消、恢复；崩溃后不依赖进程内状态。
 - 最终 Finding 必须绑定可检查的分析证据及实际使用的 ProjectFileVersion。
 
@@ -360,7 +360,7 @@ Model Request
 ### 10.2 默认策略
 
 - 密码、Token、私钥、Cookie、连接串：阻断请求，不建立映射。
-- 邮箱、手机号、银行卡、身份证及用户自定义明确规则：Task 内稳定的类型化占位。
+- 邮箱、手机号、银行卡、身份证及用户自定义明确规则：当前 Agent scope 内稳定的类型化占位。
 - 姓名、自然语言地址等 NER：可选增强，不作为 V1 默认路径。
 - 其他业务数据允许发送给云模型。
 
@@ -654,7 +654,7 @@ SSE/WebSocket 流式接口可选。V1 不提供 Webhook 和外部触发器。
 - 生成代码从未在 Host 执行；
 - Runtime DB、Privacy DB 和凭据从未进入 Sandbox；
 - 凭据未越过 ModelGateway；
-- PII 占位不修改本地原始数据，并能在 Task 内稳定恢复；
+- PII 占位不修改本地原始数据，并能在当前 Agent scope 内稳定恢复；
 - Project 原始文件版本不可变，新上传生成新版本；
 - Run 恢复始终使用相同 ProjectSnapshot；
 - 两个 Task 可并行分析同一 Project，且 Sandbox、working、staging 和取消互不影响；

@@ -65,6 +65,24 @@ export interface Session {
   created_at: string;
 }
 
+export type MessageRole = "user" | "assistant" | "system";
+
+export interface ConversationMessage {
+  id: string;
+  project_id: string;
+  session_id: string;
+  role: MessageRole;
+  content: string;
+  created_at: string;
+}
+
+export interface ConversationResponse {
+  user: ConversationMessage;
+  assistant: ConversationMessage;
+  snapshot_id: string | null;
+  analysis_job: Record<string, string> | null;
+}
+
 export interface Task {
   id: string;
   project_id: string;

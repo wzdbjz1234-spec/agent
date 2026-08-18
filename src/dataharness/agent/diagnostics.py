@@ -34,7 +34,7 @@ def configure_execution_logging() -> None:
 
 def log_model_output(
     gateway: ModelGateway,
-    task_id: TaskId,
+    task_id: str,
     raw_text: str,
     *,
     run_id: RunId | None = None,
@@ -44,6 +44,7 @@ def log_model_output(
     payload = _try_json(safe_text)
     reasoning = _first_text(payload, "reasoning", "reasoning_content", "thought")
     tool_call = payload.get("tool_call") if isinstance(payload, dict) else None
+    tool_calls = payload.get("tool_calls") if isinstance(payload, dict) else None
     if isinstance(tool_call, dict) and isinstance(tool_call.get("name"), str):
         event: dict[str, Any] = {
             "event": "MODEL_OUTPUT",
@@ -51,6 +52,20 @@ def log_model_output(
             "task_id": str(task_id),
             "tool": tool_call["name"],
             "arguments": _bound(tool_call.get("args", {})),
+        }
+        if reasoning:
+            event["reasoning"] = _bound(reasoning)
+    elif isinstance(tool_calls, list) and tool_calls:
+        event = {
+            "event": "MODEL_OUTPUT",
+            "kind": "TOOL_CALLS",
+            "task_id": str(task_id),
+            "tools": [
+                str(item.get("name"))
+                for item in tool_calls
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+            ],
+            "arguments": _bound(tool_calls),
         }
         if reasoning:
             event["reasoning"] = _bound(reasoning)
@@ -75,7 +90,7 @@ def log_model_output(
 
 
 def log_model_error(
-    task_id: TaskId,
+    task_id: str,
     *,
     run_id: RunId | None = None,
     error_code: str | None = None,
@@ -168,7 +183,7 @@ def _emit(event: dict[str, Any], *, run_id: RunId | None, level: int = logging.I
     _LOGGER.log(level, "[agent] %s", json.dumps(event, ensure_ascii=False, sort_keys=True))
 
 
-def _sanitize(gateway: ModelGateway, task_id: TaskId, text: str) -> str:
+def _sanitize(gateway: ModelGateway, task_id: str, text: str) -> str:
     """脱敏失败时 fail-closed；诊断日志不能反过来阻断 Agent。"""
     try:
         return gateway.sanitize_log(task_id, text).cloud_text

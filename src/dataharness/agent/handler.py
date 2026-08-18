@@ -22,7 +22,6 @@ from dataharness.workspace import VirtualWorkspace, WorkspaceBridge
 
 from .assembly import create_agent, default_usage_limits
 from .context import ContextCheckpointManager, ContextCompactor
-from .intent import PromptIntent, casual_reply, classify_prompt
 from .models import AgentDependencies
 from .runner import AgentBudgetExhausted, AgentRunner
 
@@ -109,21 +108,13 @@ class AgentRunHandler:
         del run
         return False
 
-    def _write_answer(self, context: RunExecutionContext, *, status: str, answer: str) -> None:
-        """把已脱敏的用户可见回答写入 Task Workspace，供 API 稳定读取。"""
-        payload = json.dumps(
-            {
-                "schema_version": 1,
-                "task_id": str(context.run.task_id),
-                "status": status,
-                "answer": answer,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+    def _write_answer(self, context: RunExecutionContext, *, answer: str) -> None:
+        """把用户可见回答作为普通 UTF-8 文本保存，不制造响应 JSON。"""
         self._workspace.write_task_state(
-            context.run.project_id, context.run.task_id, "ANSWER.json", payload
+            context.run.project_id,
+            context.run.task_id,
+            "ANSWER.txt",
+            answer.encode("utf-8"),
         )
 
     @staticmethod
@@ -138,7 +129,7 @@ class AgentRunHandler:
             uow.repo.append_event("run", str(context.run.id), event_type, context.now, metadata)
 
     async def __call__(self, context: RunExecutionContext) -> RunOutcome:
-        """执行一次 Agent，并在输出后运行 Host Verification Gate。"""
+        """执行一次 Agent；只有提交 Finding 时才运行正式证据验证。"""
         try:
             prompt = self._prompt(context)
         except AgentPromptError:
@@ -147,32 +138,6 @@ class AgentRunHandler:
                 decision=ExecutionDecision.WAITING,
                 wait_reason=WaitReason.USER_INPUT,
             )
-        if classify_prompt(prompt) is PromptIntent.CASUAL:
-            answer = casual_reply(prompt)
-            self._write_answer(context, status="COMPLETED", answer=answer)
-            self._event(context, "AGENT_COMPLETED", references=0, messages=0, mode="CASUAL")
-            return RunOutcome(decision=ExecutionDecision.SUCCEEDED, phase=RunPhase.REASONING)
-        if self._sandbox is None:
-            self._event(context, "AGENT_WAITING", reason=WaitReason.MISSING_DEPENDENCY.value)
-            return RunOutcome(
-                decision=ExecutionDecision.WAITING,
-                wait_reason=WaitReason.MISSING_DEPENDENCY,
-            )
-        if self._bridge is None:
-            self._event(context, "AGENT_WAITING", reason="PUBLICATION_NOT_CONFIGURED")
-            return RunOutcome(
-                decision=ExecutionDecision.WAITING,
-                wait_reason=WaitReason.MISSING_DEPENDENCY,
-            )
-        try:
-            prompt = self._prompt(context)
-        except AgentPromptError:
-            self._event(context, "AGENT_WAITING", reason=WaitReason.USER_INPUT.value)
-            return RunOutcome(
-                decision=ExecutionDecision.WAITING,
-                wait_reason=WaitReason.USER_INPUT,
-            )
-
         task = self._get_task(context)
         manager = ContextCheckpointManager(
             self._workspace,
@@ -257,9 +222,9 @@ class AgentRunHandler:
                 )
             raise
         except UnexpectedModelBehavior:
-            # PydanticAI 在结构化输出重试耗尽后抛出该稳定异常；它和 Provider 的
-            # MODEL_RESPONSE_INVALID 属于同一类可诊断的模型协议问题，不应让整个
-            # Run 变成无原因的 INTERNAL_ERROR/FAILED。保留用户可恢复的 WAITING 语义。
+            # PydanticAI 在工具循环/模型协议重试耗尽后抛出该稳定异常；它和 Provider
+            # 的 MODEL_RESPONSE_INVALID 属于同一类可诊断问题，不应让 Run 变成无原因的
+            # INTERNAL_ERROR/FAILED。保留用户可恢复的 WAITING 语义。
             self._event(context, "AGENT_WAITING", reason="MODEL_RESPONSE_INVALID")
             return RunOutcome(
                 decision=ExecutionDecision.WAITING,
@@ -273,16 +238,6 @@ class AgentRunHandler:
                 wait_reason=WaitReason.USER_INPUT,
             )
 
-        # Agent 的 WAITING 是用户交互语义；模型不得写入任意状态字符串。
-        if result.output.status == "WAITING":
-            self._write_answer(context, status="WAITING", answer=result.output.answer)
-            self._event(context, "AGENT_WAITING", reason=WaitReason.USER_INPUT.value)
-            return RunOutcome(
-                decision=ExecutionDecision.WAITING,
-                wait_reason=WaitReason.USER_INPUT,
-                checkpoint=self._checkpoint(manager),
-            )
-
         if memory is not None:
             memory.remember(
                 task_id=context.run.task_id,
@@ -293,7 +248,7 @@ class AgentRunHandler:
                 references=result.output.references,
                 created_at=context.now,
             )
-        self._write_answer(context, status="COMPLETED", answer=result.output.answer)
+        self._write_answer(context, answer=result.output.text)
         if self._verification is not None:
             summaries = analysis.summaries_for_run()
             with self._store.unit_of_work() as uow:
@@ -304,7 +259,7 @@ class AgentRunHandler:
         self._event(
             context,
             "AGENT_COMPLETED",
-            references=len(result.output.references),
+            references=0,
             messages=result.messages_count,
         )
         restored = manager.load_latest()

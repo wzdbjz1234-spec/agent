@@ -15,6 +15,7 @@ def test_default_paths_derived_from_runtime_root() -> None:
     assert settings.paths.projects_root == settings.paths.runtime_data_root / "projects"
     assert settings.paths.privacy_root == settings.paths.runtime_data_root / "privacy"
     assert settings.paths.runtime_db == settings.paths.runtime_data_root / "runtime.db"
+    assert settings.paths.skills_root == Path("skills")
 
 
 def test_default_sandbox_network_disabled() -> None:
@@ -49,6 +50,12 @@ def test_supported_formats_from_toml_list(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('[extraction]\nsupported_formats = ["csv", "pdf"]\n', encoding="utf-8")
     assert load_settings(config).extraction.supported_formats == ("csv", "pdf")
+
+
+def test_active_skills_are_explicitly_configured(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[skills]\nactive = ["wolfram"]\n', encoding="utf-8")
+    assert load_settings(config).skills.active == ("wolfram",)
 
 
 def test_load_settings_invalid_raises(tmp_path: Path) -> None:

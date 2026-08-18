@@ -15,6 +15,7 @@ from typing import Any
 
 from dataharness.analysis import ProjectFileView, VerificationService
 from dataharness.config import Settings
+from dataharness.conversations import ConversationAgentService
 from dataharness.domain import (
     ArtifactId,
     FileId,
@@ -28,11 +29,21 @@ from dataharness.domain import (
     TaskStatus,
 )
 from dataharness.orchestration import RunService, SessionService, TaskService
+from dataharness.privacy import (
+    ModelGateway,
+    ModelProviderError,
+    PlaceholderStore,
+    PrivacyPolicy,
+    SecretDetectedError,
+)
 from dataharness.projects import ProjectCorpus
+from dataharness.providers.model import OpenAICompatibleCloudModelProvider
 from dataharness.providers.observability import OpenTelemetryAdapter
 from dataharness.providers.workspace import LocalWorkspace, normalize_filename
+from dataharness.skills import SkillRegistry
 from dataharness.storage import (
     EventRecord,
+    PrivacyConnectionFactory,
     RuntimeConnectionFactory,
     SqlitePublicationJournal,
     SqliteRuntimeStore,
@@ -60,6 +71,8 @@ class ApiService:
         workspace: LocalWorkspace | None = None,
         diagnostics: dict[str, object] | None = None,
         worker_health_file: Path | None = None,
+        conversation_agent: ConversationAgentService | None = None,
+        skills: SkillRegistry | None = None,
     ) -> None:
         self.store = store
         self.corpus = corpus
@@ -74,6 +87,10 @@ class ApiService:
         # API 只读取 Worker 的安全心跳投影，不读取 Worker 日志、prompt 或 Runtime
         # 私密内容。文件不存在时保留 ``not_reported``，避免把“没有监督证据”伪装成健康。
         self._worker_health_file = worker_health_file
+        # Chat is deliberately an optional seam so API tests and offline installs can
+        # inject a fake Agent without assembling a model provider.
+        self.conversation_agent = conversation_agent
+        self.skills = skills
         # 诊断抽屉只需要运行状态摘要；这里不保存或返回 API Key、SQLite 内容和
         # Workspace 原始文件清单。Fake Service 未提供时使用明确的未知状态。
         self._diagnostics = diagnostics or {
@@ -114,7 +131,15 @@ class ApiService:
         tasks = TaskService(store, workspace=workspace)
         runs = RunService(store, workspace=workspace)
         sessions = SessionService(store)
-        return cls(
+        provider = OpenAICompatibleCloudModelProvider.from_config(settings.model)
+        privacy = PlaceholderStore(
+            PrivacyConnectionFactory(
+                settings.paths.privacy_root or settings.paths.runtime_data_root / "privacy",
+                settings.paths.runtime_db,
+            )
+        )
+        skills = SkillRegistry(settings.paths.skills_root or Path("skills"))
+        service = cls(
             store,
             corpus,
             tasks,
@@ -146,7 +171,18 @@ class ApiService:
             worker_health_file=(
                 Path(value) if (value := os.getenv("DATAHARNESS_WORKER_HEALTH_FILE")) else None
             ),
+            skills=skills,
         )
+        service.conversation_agent = ConversationAgentService(
+            store,
+            corpus,
+            workspace,
+            ModelGateway(provider, PrivacyPolicy(privacy)),
+            skills=skills,
+            analysis_job_launcher=service.launch_analysis_job,
+            active_skill_names=settings.skills.active,
+        )
+        return service
 
     def list_projects(self) -> tuple[Any, ...]:
         with self.store.unit_of_work() as uow:
@@ -298,6 +334,40 @@ class ApiService:
     def list_sessions(self, project_id: str):
         return self.sessions.list_for_project(ProjectId(project_id))
 
+    def list_skills(self):
+        if self.skills is None:
+            return ()
+        return self.skills.discover()
+
+    def list_conversation_messages(self, project_id: str, session_id: str):
+        project = ProjectId(project_id)
+        session = SessionId(session_id)
+        with self.store.unit_of_work() as uow:
+            stored = uow.repo.get_session(session)
+            if stored.project_id != project:
+                raise ApiError(404, "SESSION_NOT_FOUND", "连续对话不存在，或不属于当前项目")
+            return uow.repo.list_conversation_messages(project, session)
+
+    async def send_message(
+        self, project_id: str, session_id: str, content: str, *, persist: bool = True
+    ):
+        if self.conversation_agent is None:
+            raise ApiError(503, "CHAT_NOT_CONFIGURED", "聊天 Agent 尚未装配模型 Provider")
+        try:
+            return await self.conversation_agent.respond(
+                project_id, session_id, content, persist=persist
+            )
+        except ApiError:
+            raise
+        except SecretDetectedError as error:
+            raise ApiError(
+                400, "SENSITIVE_INPUT_BLOCKED", "消息包含不能发送到模型的凭据"
+            ) from error
+        except ModelProviderError as error:
+            raise ApiError(503, error.code, "模型服务暂不可用，请检查本地配置") from error
+        except ValueError as error:
+            raise ApiError(400, "INVALID_MESSAGE", "消息不符合当前对话的约束") from error
+
     def create_task(
         self, project_id: str, snapshot_id: str, session_id: str | None, prompt: str | None = None
     ):
@@ -314,6 +384,21 @@ class ApiService:
             self.tasks.cancel(task.id)
             raise
         return self.tasks.get(task.id), run
+
+    def launch_analysis_job(
+        self, project_id: ProjectId, session_id: SessionId, prompt: str
+    ) -> dict[str, str]:
+        """由 Chat Agent 明确调用时创建一个可恢复的 Analysis Job。"""
+        snapshot = self.corpus.create_snapshot(project_id)
+        task, run = self.create_task(
+            str(project_id), str(snapshot.id), str(session_id), prompt.strip()
+        )
+        return {
+            "task_id": str(task.id),
+            "run_id": str(run.id),
+            "snapshot_id": str(snapshot.id),
+            "status": str(task.status),
+        }
 
     def get_task(self, task_id: str):
         return self.tasks.get(TaskId(task_id))
@@ -454,12 +539,10 @@ class ApiService:
             answer = None
             if self._workspace is not None:
                 try:
-                    payload = json.loads(
-                        self._workspace.read_task_state(task.project_id, task.id, "ANSWER.json")
-                    )
-                    if isinstance(payload, dict) and isinstance(payload.get("answer"), str):
-                        answer = payload["answer"]
-                except (FileNotFoundError, OSError, ValueError):
+                    answer = self._workspace.read_task_state(
+                        task.project_id, task.id, "ANSWER.txt"
+                    ).decode("utf-8")
+                except (FileNotFoundError, OSError, UnicodeDecodeError):
                     answer = None
         return TaskAnswer(
             task_id=str(task.id),

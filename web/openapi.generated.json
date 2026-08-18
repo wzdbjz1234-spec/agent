@@ -66,6 +66,23 @@
         }
       }
     },
+    "/skills": {
+      "get": {
+        "summary": "List Skills",
+        "description": "返回本机管理员预装 Skill 的名称、说明和内容 hash。",
+        "operationId": "list_skills_skills_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/projects": {
       "get": {
         "summary": "List Projects",
@@ -408,9 +425,112 @@
         }
       }
     },
+    "/projects/{project_id}/sessions/{session_id}/messages": {
+      "get": {
+        "summary": "List Conversation Messages",
+        "description": "读取显式保存的可见消息；隐藏思考和工具载荷不属于聊天历史。",
+        "operationId": "list_conversation_messages_projects__project_id__sessions__session_id__messages_get",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Send Conversation Message",
+        "description": "运行一轮 Chat Agent；普通消息不会创建 Task/Run。",
+        "operationId": "send_conversation_message_projects__project_id__sessions__session_id__messages_post",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Project Id"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendMessageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/projects/{project_id}/files": {
       "post": {
         "summary": "Import File",
+        "description": "流式接收文件，先执行大小限制，再把阻塞导入移出事件循环。",
         "operationId": "import_file_projects__project_id__files_post",
         "parameters": [
           {
@@ -434,18 +554,6 @@
             }
           }
         ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/octet-stream": {
-              "schema": {
-                "type": "string",
-                "contentMediaType": "application/octet-stream",
-                "title": "Data"
-              }
-            }
-          }
-        },
         "responses": {
           "201": {
             "description": "Successful Response",
@@ -1419,6 +1527,27 @@
         "type": "object",
         "title": "RetryTaskRequest",
         "description": "重试仍为显式 Snapshot 选择，防止偷偷切换到项目最新文件。"
+      },
+      "SendMessageRequest": {
+        "properties": {
+          "content": {
+            "type": "string",
+            "maxLength": 200000,
+            "minLength": 1,
+            "title": "Content"
+          },
+          "persist": {
+            "type": "boolean",
+            "title": "Persist",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "title": "SendMessageRequest",
+        "description": "发送一条普通对话消息；它不会隐式创建 Task/Run。"
       },
       "ValidationError": {
         "properties": {

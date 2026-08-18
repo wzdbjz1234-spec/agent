@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from dataharness.domain import TaskId, compute_content_hash
+from dataharness.domain import compute_content_hash
 
 from .detector import PIIDetector, SecretDetector, SensitiveMatch
 from .placeholders import PlaceholderStore, ScanCacheEntry
@@ -68,13 +68,13 @@ class PrivacyPolicy:
         self._secrets = secret_detector or SecretDetector()
         self._pii = pii_detector or PIIDetector()
 
-    def _scan(self, task_id: TaskId, text: str) -> ScanCacheEntry:
+    def _scan(self, scope_id: str, text: str) -> ScanCacheEntry:
         content_hash = str(compute_content_hash(text.encode("utf-8")))
-        cached = self._store.get_cached_scan(task_id, content_hash)
+        cached = self._store.get_cached_scan(scope_id, content_hash)
         if cached is not None:
             return cached
         entry = ScanCacheEntry(secrets=self._secrets.scan(text), pii=self._pii.scan(text))
-        self._store.cache_scan(task_id, content_hash, entry)
+        self._store.cache_scan(scope_id, content_hash, entry)
         return entry
 
     @staticmethod
@@ -87,31 +87,33 @@ class PrivacyPolicy:
             secret_count=len(entry.secrets),
         )
 
-    def prepare_request(self, task_id: TaskId, text: str) -> PreparedRequest:
-        """扫描新增请求；凭据 fail closed，PII 转为该 Task 专属的云端视图。"""
-        entry = self._scan(task_id, text)
+    def prepare_request(self, scope_id: str, text: str) -> PreparedRequest:
+        """扫描新增请求；凭据 fail closed，PII 转为当前 scope 专属的云端视图。"""
+        entry = self._scan(scope_id, text)
         if entry.secrets:
             raise SecretDetectedError(entry.secrets)
-        return PreparedRequest(self._store.mask(task_id, text, entry.pii), self._audit(text, entry))
+        return PreparedRequest(
+            self._store.mask(scope_id, text, entry.pii), self._audit(text, entry)
+        )
 
     def sanitize_boundary_text(
-        self, task_id: TaskId, text: str, kind: BoundaryKind
+        self, scope_id: str, text: str, kind: BoundaryKind
     ) -> PreparedRequest:
         """对 Provider 返回内容及所有辅助文本做再扫描并返回可记录的脱敏版本。"""
         del kind  # 类别属于调用方审计维度；所有边界共享同一不可绕过的规则。
-        entry = self._scan(task_id, text)
+        entry = self._scan(scope_id, text)
         redacted = text
         for match in sorted(entry.secrets, key=lambda item: item.start, reverse=True):
             redacted = redacted[: match.start] + f"<SECRET:{match.kind}>" + redacted[match.end :]
         # Secret 替换会改变位置，因此对替换后的文本重新检测 PII 后再建立映射。
         pii_after_secret_redaction = self._pii.scan(redacted)
         return PreparedRequest(
-            self._store.mask(task_id, redacted, pii_after_secret_redaction),
+            self._store.mask(scope_id, redacted, pii_after_secret_redaction),
             self._audit(text, entry),
         )
 
     def restore_tool_input(
-        self, task_id: TaskId, text: str, *, allowed_kinds: tuple[str, ...]
+        self, scope_id: str, text: str, *, allowed_kinds: tuple[str, ...]
     ) -> str:
         """在进入 Sandbox 前按工具声明的 PII 类型白名单受控恢复。"""
-        return self._store.restore(task_id, text, allowed_kinds=allowed_kinds)
+        return self._store.restore(scope_id, text, allowed_kinds=allowed_kinds)

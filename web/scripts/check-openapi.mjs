@@ -8,13 +8,15 @@ const required = {
   "/projects/{project_id}/files": ["get", "post"],
   "/projects/{project_id}/snapshots": ["post"],
   "/projects/{project_id}/sessions": ["get", "post"],
+  "/projects/{project_id}/sessions/{session_id}/messages": ["get", "post"],
   "/projects/{project_id}/tasks": ["get", "post"],
   "/tasks/{task_id}": ["get"],
   "/tasks/{task_id}/events/stream": ["get"],
   "/tasks/{task_id}/answer": ["get"],
   "/tasks/{task_id}/findings": ["get"],
   "/tasks/{task_id}/lineage": ["get"],
-  "/diagnostics": ["get"]
+  "/diagnostics": ["get"],
+  "/skills": ["get"]
 };
 for (const [path, methods] of Object.entries(required)) {
   for (const method of methods) {

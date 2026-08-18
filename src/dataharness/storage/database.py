@@ -6,8 +6,6 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from dataharness.domain import TaskId
-
 from .migrate import migrate
 
 
@@ -43,7 +41,7 @@ class RuntimeConnectionFactory:
 
 @dataclass(frozen=True, slots=True)
 class PrivacyConnectionFactory:
-    """为每个 Task 派生独立 Privacy DB；本阶段不定义其业务 schema。"""
+    """为每个 Agent scope 派生独立 Privacy DB；本阶段不定义其业务 schema。"""
 
     root: Path
     runtime_db_path: Path
@@ -56,16 +54,16 @@ class PrivacyConnectionFactory:
         object.__setattr__(self, "root", resolved_root)
         object.__setattr__(self, "runtime_db_path", runtime)
 
-    def path_for(self, task_id: TaskId) -> Path:
-        """返回 Task 专属路径；ID 只作为单个文件名且禁止路径分隔符。"""
-        value = str(task_id)
+    def path_for(self, scope_id: str) -> Path:
+        """返回 Agent scope 专属路径；ID 只作为单个文件名且禁止路径分隔符。"""
+        value = str(scope_id)
         if not value or Path(value).name != value or "/" in value or "\\" in value:
-            raise ValueError("task_id 不能包含路径分隔符")
+            raise ValueError("scope_id 不能包含路径分隔符")
         return self.root / f"{value}.db"
 
-    def connect(self, task_id: TaskId) -> sqlite3.Connection:
-        """创建 Task Privacy SQLite 连接，与 Runtime 连接和迁移序列完全分离。"""
-        path = self.path_for(task_id)
+    def connect(self, scope_id: str) -> sqlite3.Connection:
+        """创建 scope Privacy SQLite 连接，与 Runtime 连接和迁移序列完全分离。"""
+        path = self.path_for(scope_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
         _configure(connection, wal=True)

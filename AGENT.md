@@ -66,7 +66,7 @@ V1 不依赖 Prefect、AgentFS、CodeMode/Monty、向量数据库、在线数据
 
 - LLM 生成的 Python/SQL、Skill 脚本和文件内代码一律视为不可信，只能在 OpenSandbox 中执行；Host 禁止 `exec`、`eval`、import 或等价动态执行。
 - Runtime SQLite、Task Privacy SQLite、Host 凭据、Docker socket、其他 Project/Task 路径不得暴露给 Agent 或 Sandbox。
-- 所有云模型请求必须经过统一 ModelGateway。凭据命中即阻断；常见 PII 使用 Task 内稳定占位；其他业务数据允许发送给用户配置的云模型。
+- 所有云模型请求必须经过统一 ModelGateway。凭据命中即阻断；常见 PII 使用当前 Agent scope 内稳定占位；其他业务数据允许发送给用户配置的云模型。
 - Sandbox 默认断网，使用固定 image digest，只读挂载当前 Run 的 ProjectSnapshot，并只写当前 Task 的 working/staging。V1 不提供运行时装包、外部 API、浏览器、邮件或在线数据库工具。
 - Project 原始文件按 ProjectFileVersion 只读且不可变；同一逻辑文件更新时创建新版本。Agent 只能在当前 Task 的 working 和当前 Step 的 staging 写派生文件。
 - 对话、Sandbox 内存和自然语言摘要不是事实来源。Project/FileVersion/Snapshot、Task/Run/Step 与领域元数据写入 Runtime SQLite；项目和任务文件写入 Workspace；模型步骤写入 PydanticAI checkpoint。

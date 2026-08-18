@@ -1,4 +1,4 @@
-"""Task 隔离的 PII 占位映射与检测结果缓存。"""
+"""按 Agent scope 隔离的 PII 占位映射与检测结果缓存。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from dataharness.domain import TaskId, compute_content_hash
+from dataharness.domain import compute_content_hash
 from dataharness.storage import PrivacyConnectionFactory
 
 from .detector import SensitiveMatch
@@ -17,7 +17,7 @@ _PLACEHOLDER = re.compile(r"<PII:([A-Z][A-Z0-9_]{0,31}):(\d{4,})>")
 
 
 class PlaceholderRestoreError(ValueError):
-    """工具输入包含不存在、跨 Task 或类型不匹配的占位符。"""
+    """工具输入包含不存在、跨 scope 或类型不匹配的占位符。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +29,7 @@ class ScanCacheEntry:
 
 
 class PlaceholderStore:
-    """每个 Task 一份 Privacy SQLite 的映射仓库。
+    """每个 Conversation/Analysis scope 一份 Privacy SQLite 的映射仓库。
 
     映射明文只存于受限的 Privacy DB；Runtime SQLite、Workspace、Sandbox、日志和审计对象
     都不会接触它。扫描缓存只保存内容哈希、种类和字符位置，避免为缓存复制敏感原文。
@@ -38,8 +38,8 @@ class PlaceholderStore:
     def __init__(self, connections: PrivacyConnectionFactory) -> None:
         self._connections = connections
 
-    def _connect(self, task_id: TaskId) -> sqlite3.Connection:
-        connection = self._connections.connect(task_id)
+    def _connect(self, scope_id: str) -> sqlite3.Connection:
+        connection = self._connections.connect(scope_id)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS pii_mappings (
@@ -69,9 +69,9 @@ class PlaceholderStore:
     def _decode(value: str) -> tuple[SensitiveMatch, ...]:
         return tuple(SensitiveMatch(**item) for item in json.loads(value))
 
-    def get_cached_scan(self, task_id: TaskId, content_hash: str) -> ScanCacheEntry | None:
+    def get_cached_scan(self, scope_id: str, content_hash: str) -> ScanCacheEntry | None:
         """取得同一内容的既有检测结果；调用方仍以当前文本切片，不读取原文缓存。"""
-        connection = self._connect(task_id)
+        connection = self._connect(scope_id)
         try:
             row = connection.execute(
                 "SELECT secret_matches_json, pii_matches_json "
@@ -84,9 +84,9 @@ class PlaceholderStore:
         finally:
             connection.close()
 
-    def cache_scan(self, task_id: TaskId, content_hash: str, entry: ScanCacheEntry) -> None:
+    def cache_scan(self, scope_id: str, content_hash: str, entry: ScanCacheEntry) -> None:
         """幂等保存无明文扫描缓存。"""
-        connection = self._connect(task_id)
+        connection = self._connect(scope_id)
         try:
             connection.execute(
                 "INSERT OR IGNORE INTO scan_cache("
@@ -141,12 +141,12 @@ class PlaceholderStore:
             connection.rollback()
             raise
 
-    def mask(self, task_id: TaskId, text: str, matches: Iterable[SensitiveMatch]) -> str:
-        """将 PII 替换为 Task 内稳定占位符；原始传入字符串保持不变。"""
+    def mask(self, scope_id: str, text: str, matches: Iterable[SensitiveMatch]) -> str:
+        """将 PII 替换为当前 scope 内稳定占位符；原始传入字符串保持不变。"""
         selected = tuple(matches)
         if not selected:
             return text
-        connection = self._connect(task_id)
+        connection = self._connect(scope_id)
         try:
             result = text
             for match in sorted(selected, key=lambda item: item.start, reverse=True):
@@ -157,10 +157,10 @@ class PlaceholderStore:
         finally:
             connection.close()
 
-    def restore(self, task_id: TaskId, text: str, *, allowed_kinds: Iterable[str]) -> str:
+    def restore(self, scope_id: str, text: str, *, allowed_kinds: Iterable[str]) -> str:
         """仅恢复当前 Task 已登记且显式允许类型的占位符，拒绝模型伪造的标记。"""
         allowed = frozenset(allowed_kinds)
-        connection = self._connect(task_id)
+        connection = self._connect(scope_id)
         try:
 
             def replace(match: re.Match[str]) -> str:

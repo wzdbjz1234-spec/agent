@@ -11,7 +11,7 @@ from dataharness.privacy import ModelGateway
 from dataharness.skills import LoadedSkill, SkillRegistry
 
 from .model import gateway_function_model
-from .models import AgentDependencies, AgentFinalOutput
+from .models import AgentDependencies
 from .tools import (
     execute_python,
     execute_sql,
@@ -22,6 +22,7 @@ from .tools import (
     preview_project_table,
     publish_chart,
     run_skill_script,
+    run_wolfram,
     search_history,
     search_project,
     submit_finding,
@@ -46,8 +47,8 @@ def create_agent(
     skills: SkillRegistry,
     active_skills: tuple[tuple[str, ContentHash | None], ...] = (),
     memory: MemoryCapability | None = None,
-) -> Agent[AgentDependencies, AgentFinalOutput]:
-    """组装单一 PydanticAI Agent，并仅注册固定的窄工具。"""
+) -> Agent[AgentDependencies, str]:
+    """组装单一 Agent；最终回答保持自然语言，工具参数仍是类型化的。"""
     loaded = tuple(
         skills.activate(name, expected_hash=expected_hash) for name, expected_hash in active_skills
     )
@@ -65,6 +66,8 @@ def create_agent(
     ]
     if loaded:
         tools.append(run_skill_script)
+    if any(item.descriptor.name.casefold() == "wolfram" for item in loaded):
+        tools.append(run_wolfram)
     if memory is not None:
         tools.append(search_history)
     instructions = (
@@ -73,13 +76,14 @@ def create_agent(
         "跨文件检索必须使用 ProjectCorpus 工具，历史检索只能用于辅助上下文。"
         "checkpoint summary 只是摘要，不是事实；所有 Dataset、Artifact、Finding 和文件事实"
         "必须来自工具返回的稳定引用。"
-        "最终必须输出结构化 JSON，status 只能是 COMPLETED 或 WAITING；无论 status 如何，"
-        "都必须使用 answer 字段承载面向用户的说明，不要使用 summary 字段，并列出"
-        " unresolved_issues。\n\n" + _skill_instructions(loaded)
+        "如果启用了 Wolfram Skill，可用 run_wolfram 在 Sandbox 中做数学/统计校验；"
+        "当不再需要工具时，直接输出面向用户的自然语言回答。不要包装成 JSON，"
+        "不要虚构工具结果；如果信息不足，直接向用户说明缺口。\n\n"
+        + _skill_instructions(loaded)
     )
     return Agent(
         gateway_function_model(gateway, task_id, run_id),
-        output_type=AgentFinalOutput,
+        output_type=str,
         deps_type=AgentDependencies,
         system_prompt=instructions,
         tools=tools,

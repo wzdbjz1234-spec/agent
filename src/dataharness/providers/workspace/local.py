@@ -294,7 +294,7 @@ class LocalWorkspace:
         """
         allowed = {
             "PROMPT.json",
-            "ANSWER.json",
+            "ANSWER.txt",
             "PLAN.md",
             "PROGRESS.md",
             "CONTEXT.md",
@@ -326,7 +326,7 @@ class LocalWorkspace:
         """只从受控 Task state 目录读取文件，并限制单次读取大小。"""
         if name not in {
             "PROMPT.json",
-            "ANSWER.json",
+            "ANSWER.txt",
             "PLAN.md",
             "PROGRESS.md",
             "CONTEXT.md",
